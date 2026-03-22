@@ -29,9 +29,16 @@ pub enum StructuredStmt {
 
 #[derive(Debug, Clone)]
 pub struct SwitchArm {
-    pub labels: Vec<i32>,
+    pub labels: Vec<SwitchLabel>,
     pub has_default: bool,
     pub body: Box<StructuredStmt>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SwitchLabel {
+    Int(i32),
+    String(String),
+    Enum(String),
 }
 
 pub fn decompile_method(class: &LoadedClass, method: &LoadedMethod) -> Result<StructuredStmt> {
@@ -206,7 +213,7 @@ impl<'a> Builder<'a> {
             if start_pos >= merge_pos {
                 labels.sort_unstable();
                 synthetic_merge_arms.push(SwitchArm {
-                    labels,
+                    labels: labels.into_iter().map(SwitchLabel::Int).collect(),
                     has_default,
                     body: Box::new(StructuredStmt::Basic(vec![Stmt::Break])),
                 });
@@ -231,7 +238,7 @@ impl<'a> Builder<'a> {
             }
             previous_end = arm_end;
             arms.push(SwitchArm {
-                labels,
+                labels: labels.into_iter().map(SwitchLabel::Int).collect(),
                 has_default,
                 body: Box::new(body),
             });

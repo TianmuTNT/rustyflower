@@ -229,11 +229,13 @@ fn keeps_vineflower_string_switch_fixture_stable() {
     let class_path = compile_vineflower_source("testData/src/java8/pkg/TestSwitchOnStrings.java");
     let output = rustyflower::decompile_path(&class_path).expect("fixture should decompile");
     assert!(output.contains("public class TestSwitchOnStrings"));
-    assert!(
-        output
-            .contains("rustyflower: method body decompilation is being implemented incrementally.")
-            || output.contains("switch (")
-    );
+    assert!(output.contains("switch (arg0)"));
+    assert!(output.contains("case \"xxx\":"));
+    assert!(output.contains("case \"yyy\":"));
+    assert!(output.contains("case \"AaAa\":"));
+    assert!(output.contains("case \"AaBB\":"));
+    assert!(output.contains("case \"BBAa\":"));
+    assert!(!output.contains("hashCode()"));
 }
 
 #[test]
@@ -242,11 +244,11 @@ fn keeps_vineflower_enum_switch_fixture_stable() {
     let class_path = compile_vineflower_source("testData/src/java8/pkg/TestSwitchOnEnum.java");
     let output = rustyflower::decompile_path(&class_path).expect("fixture should decompile");
     assert!(output.contains("public class TestSwitchOnEnum"));
-    assert!(
-        output
-            .contains("rustyflower: method body decompilation is being implemented incrementally.")
-            || output.contains("switch (")
-    );
+    assert!(output.contains("switch (arg0)"));
+    assert!(output.contains("case MICROSECONDS:"));
+    assert!(output.contains("case SECONDS:"));
+    assert!(!output.contains("$SwitchMap"));
+    assert!(!output.contains("ordinal()"));
 }
 
 #[test]

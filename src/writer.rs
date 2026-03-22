@@ -1,13 +1,14 @@
 use crate::expr::{BinaryOp, Literal, Stmt, StructuredExpr, UnaryOp};
 use crate::loader::{LoadedClass, LoadedConstant, LoadedField, LoadedMethod};
-use crate::structure::{StructuredStmt, decompile_method};
+use crate::lowering::{ClassPathResolver, lower_switches};
+use crate::structure::{StructuredStmt, SwitchLabel, decompile_method};
 use crate::types::{default_value, format_internal_name, format_type, parse_method_descriptor};
 use rust_asm::constants;
 use rust_asm::types::Type;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 
-pub fn write_class(class: &LoadedClass) -> String {
+pub fn write_class(class: &LoadedClass, resolver: Option<&ClassPathResolver>) -> String {
     let mut out = String::new();
     if let Some(package_name) = &class.package_name {
         let _ = writeln!(out, "package {};", package_name);
@@ -51,7 +52,7 @@ pub fn write_class(class: &LoadedClass) -> String {
     }
 
     for (index, method) in class.methods.iter().enumerate() {
-        write_method(&mut out, class, method);
+        write_method(&mut out, class, method, resolver);
         if index + 1 != class.methods.len() {
             let _ = writeln!(out);
         }
@@ -156,7 +157,12 @@ fn write_constant(value: &LoadedConstant) -> String {
     }
 }
 
-fn write_method(out: &mut String, class: &LoadedClass, method: &LoadedMethod) {
+fn write_method(
+    out: &mut String,
+    class: &LoadedClass,
+    method: &LoadedMethod,
+    resolver: Option<&ClassPathResolver>,
+) {
     if method.name == "<clinit>" {
         let _ = writeln!(out, "    static {{");
         write_unsupported_body(out, &method.parsed_descriptor.return_type);
@@ -202,6 +208,7 @@ fn write_method(out: &mut String, class: &LoadedClass, method: &LoadedMethod) {
     let _ = writeln!(out, "{header} {{");
     match decompile_method(class, method) {
         Ok(body) => {
+            let body = lower_switches(class, method, body, resolver);
             let mut ctx = MethodWriteContext::new(method);
             write_structured_stmt(out, &body, 2, &mut ctx);
         }
@@ -267,7 +274,12 @@ fn write_structured_stmt(
             let _ = writeln!(out, "{}switch ({}) {{", pad, render_expr(expr, ctx));
             for arm in arms {
                 for label in &arm.labels {
-                    let _ = writeln!(out, "{}case {}:", "    ".repeat(indent + 1), label);
+                    let _ = writeln!(
+                        out,
+                        "{}case {}:",
+                        "    ".repeat(indent + 1),
+                        render_switch_label(label)
+                    );
                 }
                 if arm.has_default {
                     let _ = writeln!(out, "{}default:", "    ".repeat(indent + 1));
@@ -300,6 +312,14 @@ fn write_structured_stmt(
             let _ = writeln!(out, "{}/* {message} */", "    ".repeat(indent));
         }
         StructuredStmt::Empty => {}
+    }
+}
+
+fn render_switch_label(label: &SwitchLabel) -> String {
+    match label {
+        SwitchLabel::Int(value) => value.to_string(),
+        SwitchLabel::String(value) => format!("{value:?}"),
+        SwitchLabel::Enum(value) => value.clone(),
     }
 }
 
