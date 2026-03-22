@@ -73,7 +73,11 @@ fn lower_stmt(
             condition,
             body: Box::new(lower_stmt(class, method, *body, resolver)),
         },
-        StructuredStmt::TryCatch { try_body, catches } => StructuredStmt::TryCatch {
+        StructuredStmt::Try {
+            try_body,
+            catches,
+            finally_body,
+        } => StructuredStmt::Try {
             try_body: Box::new(lower_stmt(class, method, *try_body, resolver)),
             catches: catches
                 .into_iter()
@@ -83,6 +87,12 @@ fn lower_stmt(
                     body: Box::new(lower_stmt(class, method, *catch.body, resolver)),
                 })
                 .collect(),
+            finally_body: finally_body
+                .map(|body| Box::new(lower_stmt(class, method, *body, resolver))),
+        },
+        StructuredStmt::Synchronized { expr, body } => StructuredStmt::Synchronized {
+            expr,
+            body: Box::new(lower_stmt(class, method, *body, resolver)),
         },
         StructuredStmt::Switch { expr, arms } => {
             let lowered_arms = arms

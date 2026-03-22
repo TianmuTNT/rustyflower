@@ -9,7 +9,7 @@ use rust_asm::insn::{FieldInsnNode, Insn, LdcValue};
 use rust_asm::opcodes;
 use rust_asm::types::Type;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum StructuredExpr {
     This,
     Var(u16),
@@ -63,7 +63,7 @@ pub enum StructuredExpr {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Literal {
     Null,
     Boolean(bool),
@@ -103,7 +103,7 @@ pub enum UnaryOp {
     Not,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Stmt {
     Assign {
         target: StructuredExpr,
@@ -115,6 +115,8 @@ pub enum Stmt {
         value: StructuredExpr,
     },
     Expr(StructuredExpr),
+    MonitorEnter(StructuredExpr),
+    MonitorExit(StructuredExpr),
     Break,
     Return(Option<StructuredExpr>),
     Throw(StructuredExpr),
@@ -530,6 +532,16 @@ fn translate_simple_instruction(translator: &mut BlockTranslator<'_>, opcode: u8
         opcodes::ARRAYLENGTH => {
             let (expr, _) = translator.pop_expr()?;
             translator.push_expr(StructuredExpr::ArrayLength(Box::new(expr)), Some(Type::Int));
+            Ok(())
+        }
+        opcodes::MONITORENTER => {
+            let expr = translator.pop_expr()?.0;
+            translator.statements.push(Stmt::MonitorEnter(expr));
+            Ok(())
+        }
+        opcodes::MONITOREXIT => {
+            let expr = translator.pop_expr()?.0;
+            translator.statements.push(Stmt::MonitorExit(expr));
             Ok(())
         }
         opcodes::ATHROW

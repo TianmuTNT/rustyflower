@@ -165,7 +165,7 @@ fn write_method(
 ) {
     if method.name == "<clinit>" {
         let _ = writeln!(out, "    static {{");
-        write_unsupported_body(out, &method.parsed_descriptor.return_type);
+        write_unsupported_body(out, &method.parsed_descriptor.return_type, None);
         let _ = writeln!(out, "    }}");
         return;
     }
@@ -212,17 +212,20 @@ fn write_method(
             let mut ctx = MethodWriteContext::new(method);
             write_structured_stmt(out, &body, 2, &mut ctx);
         }
-        Err(_) => {
-            write_unsupported_body(out, &method.parsed_descriptor.return_type);
+        Err(error) => {
+            write_unsupported_body(out, &method.parsed_descriptor.return_type, Some(&error.to_string()));
         }
     }
     let _ = writeln!(out, "    }}");
 }
 
-fn write_unsupported_body(out: &mut String, return_type: &Type) {
+fn write_unsupported_body(out: &mut String, return_type: &Type, reason: Option<&str>) {
     let _ = writeln!(
         out,
-        "        /* rustyflower: method body decompilation is being implemented incrementally. */"
+        "        /* rustyflower: method body decompilation is being implemented incrementally.{} */",
+        reason
+            .map(|reason| format!(" reason: {reason}"))
+            .unwrap_or_default()
     );
     if !matches!(return_type, Type::Void) {
         let _ = writeln!(out, "        return {};", default_value(return_type));
@@ -269,7 +272,11 @@ fn write_structured_stmt(
                 write_stmt(out, statement, indent, ctx);
             }
         }
-        StructuredStmt::TryCatch { try_body, catches } => {
+        StructuredStmt::Try {
+            try_body,
+            catches,
+            finally_body,
+        } => {
             let pad = "    ".repeat(indent);
             let _ = writeln!(out, "{}try {{", pad);
             write_structured_stmt(out, try_body, indent + 1, ctx);
@@ -285,6 +292,17 @@ fn write_structured_stmt(
                 write_structured_stmt(out, &catch.body, indent + 1, ctx);
                 let _ = writeln!(out, "{}}}", pad);
             }
+            if let Some(finally_body) = finally_body {
+                let _ = writeln!(out, "{}finally {{", pad);
+                write_structured_stmt(out, finally_body, indent + 1, ctx);
+                let _ = writeln!(out, "{}}}", pad);
+            }
+        }
+        StructuredStmt::Synchronized { expr, body } => {
+            let pad = "    ".repeat(indent);
+            let _ = writeln!(out, "{}synchronized ({}) {{", pad, render_expr(expr, ctx));
+            write_structured_stmt(out, body, indent + 1, ctx);
+            let _ = writeln!(out, "{}}}", pad);
         }
         StructuredStmt::Switch { expr, arms } => {
             let pad = "    ".repeat(indent);
@@ -389,6 +407,22 @@ fn write_stmt(out: &mut String, stmt: &Stmt, indent: usize, ctx: &mut MethodWrit
         }
         Stmt::Expr(expr) => {
             let _ = writeln!(out, "{}{};", pad, render_expr(expr, ctx));
+        }
+        Stmt::MonitorEnter(expr) => {
+            let _ = writeln!(
+                out,
+                "{}/* rustyflower: monitorenter {} */",
+                pad,
+                render_expr(expr, ctx)
+            );
+        }
+        Stmt::MonitorExit(expr) => {
+            let _ = writeln!(
+                out,
+                "{}/* rustyflower: monitorexit {} */",
+                pad,
+                render_expr(expr, ctx)
+            );
         }
         Stmt::Break => {
             let _ = writeln!(out, "{}break;", pad);

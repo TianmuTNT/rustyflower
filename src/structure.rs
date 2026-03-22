@@ -6,13 +6,18 @@ use crate::expr::{
 use crate::loader::{LoadedClass, LoadedMethod};
 use std::collections::HashSet;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum StructuredStmt {
     Sequence(Vec<StructuredStmt>),
     Basic(Vec<Stmt>),
-    TryCatch {
+    Try {
         try_body: Box<StructuredStmt>,
         catches: Vec<CatchArm>,
+        finally_body: Option<Box<StructuredStmt>>,
+    },
+    Synchronized {
+        expr: StructuredExpr,
+        body: Box<StructuredStmt>,
     },
     Switch {
         expr: StructuredExpr,
@@ -31,14 +36,14 @@ pub enum StructuredStmt {
     Empty,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SwitchArm {
     pub labels: Vec<SwitchLabel>,
     pub has_default: bool,
     pub body: Box<StructuredStmt>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct CatchArm {
     pub catch_type: String,
     pub catch_var: String,
@@ -53,15 +58,6 @@ pub enum SwitchLabel {
 }
 
 pub fn decompile_method(class: &LoadedClass, method: &LoadedMethod) -> Result<StructuredStmt> {
-    if method
-        .exception_table
-        .iter()
-        .any(|entry| entry.catch_type == 0)
-    {
-        return Err(DecompileError::Unsupported(
-            "catch-all/finally reconstruction is not implemented yet".to_string(),
-        ));
-    }
     let cfg = build_cfg(method)?;
     if cfg.blocks.is_empty() {
         return Ok(StructuredStmt::Sequence(Vec::new()));
@@ -76,11 +72,12 @@ pub fn decompile_method(class: &LoadedClass, method: &LoadedMethod) -> Result<St
         visited: HashSet::new(),
         suppressed_try_starts: HashSet::new(),
     };
-    Ok(StructuredStmt::Sequence(builder.build_range(
+    let root = StructuredStmt::Sequence(builder.build_range(
         0,
         cfg.blocks.len(),
         GotoHandling::Comment,
-    )?))
+    )?);
+    Ok(rewrite_synchronized_stmt(root))
 }
 
 struct Builder<'a> {
@@ -113,6 +110,14 @@ impl<'a> Builder<'a> {
             let block_start = self.cfg.blocks[block_id].start_offset;
             if self.visited.contains(&block_id) {
                 pos += 1;
+                continue;
+            }
+            if let Some((stmt, next_pos, consumed)) =
+                self.try_build_synchronized(pos, end_pos, goto_handling)?
+            {
+                self.visited.extend(consumed);
+                statements.push(stmt);
+                pos = next_pos;
                 continue;
             }
             if !self.suppressed_try_starts.contains(&block_start)
@@ -188,6 +193,111 @@ impl<'a> Builder<'a> {
         StructuredStmt::Basic(stmts)
     }
 
+    fn try_build_synchronized(
+        &mut self,
+        pos: usize,
+        end_pos: usize,
+        goto_handling: GotoHandling,
+    ) -> Result<Option<(StructuredStmt, usize, Vec<usize>)>> {
+        let next_pos = pos + 1;
+        if next_pos >= end_pos {
+            return Ok(None);
+        }
+        let prefix_block_id = self.cfg.order[pos];
+        let prefix_stmts = &self.semantics[prefix_block_id].stmts;
+        let Some((monitor_expr, prefix_consumed)) = extract_monitor_enter(prefix_stmts) else {
+            return Ok(None);
+        };
+
+        let region_start_offset = self.cfg.blocks[self.cfg.order[next_pos]].start_offset;
+        let mut catch_all_entries = self
+            .method
+            .exception_table
+            .iter()
+            .filter(|entry| entry.start_pc == region_start_offset && entry.catch_type == 0)
+            .cloned()
+            .collect::<Vec<_>>();
+        if catch_all_entries.is_empty() {
+            return Ok(None);
+        }
+        let end_pc = catch_all_entries[0].end_pc;
+        catch_all_entries.retain(|entry| entry.end_pc == end_pc && entry.catch_type == 0);
+        if catch_all_entries.is_empty() {
+            return Ok(None);
+        }
+        let handler_pc = catch_all_entries[0].handler_pc;
+        let try_end_pos = self.position_for_offset(end_pc)?;
+        let handler_pos = self.position_for_offset(handler_pc)?;
+        if handler_pos < try_end_pos {
+            return Ok(None);
+        }
+
+        let merge_pos = self.find_try_catch_merge_pos(
+            next_pos,
+            try_end_pos,
+            &[],
+            Some((handler_pos, handler_pc)),
+            end_pos,
+        );
+        let merge_offset = if merge_pos < self.cfg.order.len() {
+            Some(self.cfg.blocks[self.cfg.order[merge_pos]].start_offset)
+        } else {
+            None
+        };
+
+        self.suppressed_try_starts.insert(region_start_offset);
+        self.suppressed_try_starts
+            .insert(self.cfg.blocks[self.cfg.order[handler_pos]].start_offset);
+        let try_body = wrap_sequence(self.build_range(
+            next_pos,
+            try_end_pos,
+            match merge_offset {
+                Some(offset) => GotoHandling::Suppress(offset),
+                None => goto_handling,
+            },
+        )?);
+        let mut try_body = strip_try_comments(try_body);
+        let handler_body = wrap_sequence(self.build_range(
+            handler_pos,
+            merge_pos,
+            match merge_offset {
+                Some(offset) => GotoHandling::Suppress(offset),
+                None => goto_handling,
+            },
+        )?);
+        let handler_body = strip_try_comments(handler_body);
+        self.suppressed_try_starts
+            .remove(&self.cfg.blocks[self.cfg.order[handler_pos]].start_offset);
+        self.suppressed_try_starts.remove(&region_start_offset);
+
+        let (canonical_finally, _slot) = extract_finally_from_handler(handler_body)?;
+        if !is_monitor_only_finally(&canonical_finally) {
+            return Ok(None);
+        }
+        let sync_body = strip_monitor_exit_suffix(try_body, &canonical_finally)
+            .ok_or_else(|| {
+                DecompileError::Unsupported(
+                    "synchronized body does not match monitor exit pattern".to_string(),
+                )
+            })?;
+
+        let mut items = Vec::new();
+        let mut prefix_remaining = prefix_stmts.clone();
+        prefix_remaining.truncate(prefix_remaining.len().saturating_sub(prefix_consumed));
+        if !prefix_remaining.is_empty() {
+            items.push(StructuredStmt::Basic(prefix_remaining));
+        }
+        items.push(StructuredStmt::Synchronized {
+            expr: monitor_expr,
+            body: Box::new(sync_body),
+        });
+
+        let consumed = (pos..merge_pos.min(self.cfg.order.len()))
+            .map(|region_pos| self.cfg.order[region_pos])
+            .collect::<Vec<_>>();
+        Ok(Some((wrap_sequence(items), merge_pos, consumed)))
+    }
+
     fn try_build_try_catch(
         &mut self,
         pos: usize,
@@ -199,7 +309,7 @@ impl<'a> Builder<'a> {
             .method
             .exception_table
             .iter()
-            .filter(|entry| entry.start_pc == start_offset && entry.catch_type != 0)
+            .filter(|entry| entry.start_pc == start_offset)
             .cloned()
             .collect::<Vec<_>>();
         if entries.is_empty() {
@@ -207,7 +317,7 @@ impl<'a> Builder<'a> {
         }
 
         let end_pc = entries[0].end_pc;
-        entries.retain(|entry| entry.end_pc == end_pc && entry.catch_type != 0);
+        entries.retain(|entry| entry.end_pc == end_pc);
         if entries.is_empty() {
             return Ok(None);
         }
@@ -220,30 +330,39 @@ impl<'a> Builder<'a> {
             return Ok(None);
         }
 
-        let mut handlers = Vec::new();
+        let mut typed_handlers = Vec::new();
+        let mut catch_all_handler = None;
         for entry in entries {
             let handler_pos = self.position_for_offset(entry.handler_pc)?;
             if handler_pos < try_end_pos {
                 return Ok(None);
             }
-            let catch_type =
-                crate::bytecode::cp_class_name(&self.class.constant_pool, entry.catch_type)
-                    .map(str::to_string)
-                    .map_err(|_| DecompileError::Unsupported("invalid catch type".to_string()))?;
-            handlers.push((handler_pos, catch_type));
+            if entry.catch_type == 0 {
+                catch_all_handler = Some((handler_pos, entry.handler_pc));
+            } else {
+                let catch_type =
+                    crate::bytecode::cp_class_name(&self.class.constant_pool, entry.catch_type)
+                        .map(str::to_string)
+                        .map_err(|_| DecompileError::Unsupported("invalid catch type".to_string()))?;
+                typed_handlers.push((handler_pos, catch_type));
+            }
         }
-        handlers.sort_by_key(|(handler_pos, _)| *handler_pos);
-        handlers.dedup_by_key(|(handler_pos, _)| *handler_pos);
+        typed_handlers.sort_by_key(|(handler_pos, _)| *handler_pos);
+        typed_handlers.dedup_by_key(|(handler_pos, _)| *handler_pos);
 
-        let merge_pos = self.find_try_catch_merge_pos(pos, try_end_pos, &handlers, end_pos);
+        let merge_pos =
+            self.find_try_catch_merge_pos(pos, try_end_pos, &typed_handlers, catch_all_handler, end_pos);
         let merge_offset = if merge_pos < self.cfg.order.len() {
             Some(self.cfg.blocks[self.cfg.order[merge_pos]].start_offset)
         } else {
             None
         };
+        let catch_all_end = catch_all_handler
+            .map(|(handler_pos, _)| self.catch_all_handler_end_pos(handler_pos, end_pos))
+            .unwrap_or(merge_pos);
 
         self.suppressed_try_starts.insert(start_offset);
-        let try_body = wrap_sequence(self.build_range(
+        let mut try_body = wrap_sequence(self.build_range(
             pos,
             try_end_pos,
             match merge_offset {
@@ -251,16 +370,117 @@ impl<'a> Builder<'a> {
                 None => goto_handling,
             },
         )?);
-        let try_body = strip_try_comments(try_body);
+        let mut try_body = strip_try_comments(try_body);
 
         let mut catches = Vec::new();
-        let mut consumed = Vec::new();
-        for region_pos in pos..try_end_pos {
-            consumed.push(self.cfg.order[region_pos]);
+        let mut consumed = (pos..merge_pos.min(self.cfg.order.len()))
+            .map(|region_pos| self.cfg.order[region_pos])
+            .collect::<Vec<_>>();
+
+        let first_handler_pos = typed_handlers
+            .first()
+            .map(|(handler_pos, _)| *handler_pos)
+            .or_else(|| catch_all_handler.map(|(handler_pos, _)| handler_pos))
+            .unwrap_or(merge_pos);
+
+        let mut finally_body = None;
+        if let Some((catch_all_pos, _handler_pc)) = catch_all_handler {
+            let catch_all_start_offset = self.cfg.blocks[self.cfg.order[catch_all_pos]].start_offset;
+            self.suppressed_try_starts.insert(catch_all_start_offset);
+            let canonical_handler_body = wrap_sequence(self.build_range(
+                catch_all_pos,
+                catch_all_end,
+                match merge_offset {
+                    Some(offset) => GotoHandling::Suppress(offset),
+                    None => goto_handling,
+                },
+            )?);
+            let canonical_handler_body = strip_try_comments(canonical_handler_body);
+            let (canonical_finally, catch_var_slot) =
+                extract_finally_from_handler(canonical_handler_body)?;
+
+            let mut rendered_finally = canonical_finally.clone();
+            if try_end_pos < first_handler_pos {
+                let normal_tail = wrap_sequence(self.build_range(
+                    try_end_pos,
+                    first_handler_pos,
+                    match merge_offset {
+                        Some(offset) => GotoHandling::Suppress(offset),
+                        None => goto_handling,
+                    },
+                )?);
+                let normal_tail = strip_try_comments(normal_tail);
+                if let Some(stripped) =
+                    remove_duplicate_finally(self.method, normal_tail.clone(), &canonical_finally)
+                {
+                    if !matches!(stripped, StructuredStmt::Empty) {
+                        let mut items = top_level_items(try_body);
+                        items.extend(top_level_items(stripped));
+                        try_body = wrap_sequence(items);
+                    } else if top_level_items(normal_tail.clone()).len()
+                        == top_level_items(canonical_finally.clone()).len()
+                    {
+                        rendered_finally = normal_tail;
+                    }
+                } else if !is_monitor_only_finally(&canonical_finally) {
+                    return Ok(None);
+                }
+            }
+
+            for (index, (handler_pos, catch_type)) in typed_handlers.iter().enumerate() {
+                let catch_end = typed_handlers
+                    .get(index + 1)
+                    .map(|(next_pos, _)| *next_pos)
+                    .unwrap_or(catch_all_pos)
+                    .min(catch_all_pos);
+                let catch_body = wrap_sequence(self.build_range(
+                    *handler_pos,
+                    catch_end,
+                    match merge_offset {
+                        Some(offset) => GotoHandling::Suppress(offset),
+                        None => goto_handling,
+                    },
+                )?);
+                let catch_body = strip_try_comments(catch_body);
+                let (catch_var, catch_body) =
+                    extract_catch_binding(self.method, catch_body, catch_type);
+                let catch_body = remove_duplicate_finally(self.method, catch_body, &canonical_finally)
+                    .ok_or_else(|| {
+                        DecompileError::Unsupported(
+                            "catch body does not match canonical finally".to_string(),
+                        )
+                    })?;
+                catches.push(CatchArm {
+                    catch_type: catch_type.clone(),
+                    catch_var,
+                    body: Box::new(catch_body),
+                });
+            }
+
+            let synchronized =
+                try_rewrite_synchronized(self.method, &try_body, &rendered_finally, catch_var_slot);
+            finally_body = Some(Box::new(rendered_finally));
+
+            self.suppressed_try_starts.remove(&catch_all_start_offset);
+            self.suppressed_try_starts.remove(&start_offset);
+            let try_stmt = if let Some((monitor_expr, sync_body)) = synchronized {
+                StructuredStmt::Synchronized {
+                    expr: monitor_expr,
+                    body: Box::new(sync_body),
+                }
+            } else {
+                StructuredStmt::Try {
+                    try_body: Box::new(try_body),
+                    catches,
+                    finally_body,
+                }
+            };
+
+            return Ok(Some((try_stmt, merge_pos, consumed)));
         }
 
-        for (index, (handler_pos, catch_type)) in handlers.iter().enumerate() {
-            let catch_end = handlers
+        for (index, (handler_pos, catch_type)) in typed_handlers.iter().enumerate() {
+            let catch_end = typed_handlers
                 .get(index + 1)
                 .map(|(next_pos, _)| *next_pos)
                 .unwrap_or(merge_pos)
@@ -276,9 +496,6 @@ impl<'a> Builder<'a> {
             let catch_body = strip_try_comments(catch_body);
             let (catch_var, catch_body) =
                 extract_catch_binding(self.method, catch_body, catch_type);
-            for region_pos in *handler_pos..catch_end {
-                consumed.push(self.cfg.order[region_pos]);
-            }
             catches.push(CatchArm {
                 catch_type: catch_type.clone(),
                 catch_var,
@@ -292,9 +509,10 @@ impl<'a> Builder<'a> {
         }
 
         Ok(Some((
-            StructuredStmt::TryCatch {
+            StructuredStmt::Try {
                 try_body: Box::new(try_body),
                 catches,
+                finally_body: None,
             },
             merge_pos,
             consumed,
@@ -680,12 +898,14 @@ impl<'a> Builder<'a> {
         try_start_pos: usize,
         try_end_pos: usize,
         handlers: &[(usize, String)],
+        catch_all_handler: Option<(usize, u16)>,
         end_pos: usize,
     ) -> usize {
         let last_handler_pos = handlers
             .iter()
             .map(|(handler_pos, _)| *handler_pos)
             .max()
+            .max(catch_all_handler.map(|(handler_pos, _)| handler_pos))
             .unwrap_or(try_end_pos);
         let mut candidates = Vec::new();
 
@@ -707,6 +927,22 @@ impl<'a> Builder<'a> {
         }
 
         candidates.into_iter().min().unwrap_or(end_pos)
+    }
+
+    fn catch_all_handler_end_pos(&self, handler_pos: usize, end_pos: usize) -> usize {
+        let mut pos = handler_pos;
+        while pos + 1 < end_pos {
+            let next = pos + 1;
+            if !matches!(
+                self.semantics[self.cfg.order[pos]].terminator,
+                Terminator::Fallthrough(Some(offset))
+                    if self.cfg.blocks[self.cfg.order[next]].start_offset == offset
+            ) {
+                break;
+            }
+            pos = next;
+        }
+        pos + 1
     }
 }
 
@@ -749,6 +985,955 @@ fn wrap_sequence(statements: Vec<StructuredStmt>) -> StructuredStmt {
             .unwrap_or(StructuredStmt::Empty),
         _ => StructuredStmt::Sequence(statements),
     }
+}
+
+fn rewrite_synchronized_stmt(stmt: StructuredStmt) -> StructuredStmt {
+    match stmt {
+        StructuredStmt::Sequence(items) => rewrite_synchronized_sequence(items),
+        StructuredStmt::Try {
+            try_body,
+            catches,
+            finally_body,
+        } => StructuredStmt::Try {
+            try_body: Box::new(rewrite_synchronized_stmt(*try_body)),
+            catches: catches
+                .into_iter()
+                .map(|catch| CatchArm {
+                    catch_type: catch.catch_type,
+                    catch_var: catch.catch_var,
+                    body: Box::new(rewrite_synchronized_stmt(*catch.body)),
+                })
+                .collect(),
+            finally_body: finally_body.map(|body| Box::new(rewrite_synchronized_stmt(*body))),
+        },
+        StructuredStmt::Switch { expr, arms } => StructuredStmt::Switch {
+            expr,
+            arms: arms
+                .into_iter()
+                .map(|arm| SwitchArm {
+                    labels: arm.labels,
+                    has_default: arm.has_default,
+                    body: Box::new(rewrite_synchronized_stmt(*arm.body)),
+                })
+                .collect(),
+        },
+        StructuredStmt::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => StructuredStmt::If {
+            condition,
+            then_branch: Box::new(rewrite_synchronized_stmt(*then_branch)),
+            else_branch: else_branch.map(|branch| Box::new(rewrite_synchronized_stmt(*branch))),
+        },
+        StructuredStmt::While { condition, body } => StructuredStmt::While {
+            condition,
+            body: Box::new(rewrite_synchronized_stmt(*body)),
+        },
+        other => other,
+    }
+}
+
+fn rewrite_synchronized_sequence(items: Vec<StructuredStmt>) -> StructuredStmt {
+    let mut rewritten = items
+        .into_iter()
+        .map(rewrite_synchronized_stmt)
+        .flat_map(top_level_items)
+        .collect::<Vec<_>>();
+    let mut output = Vec::new();
+    let mut index = 0;
+    while index < rewritten.len() {
+        if let Some((stmt, consumed)) = try_fold_synchronized_pair(&rewritten[index..]) {
+            output.push(stmt);
+            index += consumed;
+            continue;
+        }
+        output.push(rewritten[index].clone());
+        index += 1;
+    }
+    wrap_sequence(output)
+}
+
+fn try_fold_synchronized_pair(items: &[StructuredStmt]) -> Option<(StructuredStmt, usize)> {
+    if items.len() < 2 {
+        return None;
+    }
+    let StructuredStmt::Basic(prefix_stmts) = &items[0] else {
+        return None;
+    };
+    let StructuredStmt::Try {
+        try_body,
+        catches,
+        finally_body: Some(finally_body),
+    } = &items[1]
+    else {
+        return None;
+    };
+    if !catches.is_empty() {
+        return None;
+    }
+
+    let (monitor_expr, prefix_consumed) = extract_monitor_enter(prefix_stmts)?;
+    let stripped_try_body = strip_monitor_exit_suffix(*try_body.clone(), finally_body)?;
+
+    let mut seq_items = Vec::new();
+    let mut prefix_remaining = prefix_stmts.clone();
+    prefix_remaining.truncate(prefix_remaining.len().saturating_sub(prefix_consumed));
+    if !prefix_remaining.is_empty() {
+        seq_items.push(StructuredStmt::Basic(prefix_remaining));
+    }
+    seq_items.push(StructuredStmt::Synchronized {
+        expr: monitor_expr,
+        body: Box::new(stripped_try_body),
+    });
+    Some((wrap_sequence(seq_items), 2))
+}
+
+fn extract_monitor_enter(stmts: &[Stmt]) -> Option<(StructuredExpr, usize)> {
+    match stmts {
+        [.., Stmt::Assign {
+            target: StructuredExpr::Var(_slot),
+            value,
+        }, Stmt::MonitorEnter(expr)] if expr == value => Some((value.clone(), 2)),
+        [.., Stmt::Assign {
+            target: StructuredExpr::Var(_slot),
+            value,
+        }, Stmt::MonitorEnter(_expr)] => Some((value.clone(), 2)),
+        [.., Stmt::MonitorEnter(expr)] => Some((expr.clone(), 1)),
+        _ => None,
+    }
+}
+
+fn strip_monitor_exit_suffix(body: StructuredStmt, finally_body: &StructuredStmt) -> Option<StructuredStmt> {
+    let finally_items = top_level_items(finally_body.clone());
+    if finally_items.len() != 1 {
+        return None;
+    }
+    let StructuredStmt::Basic(finally_stmts) = &finally_items[0] else {
+        return None;
+    };
+    if finally_stmts.len() != 1 {
+        return None;
+    }
+    if !matches!(finally_stmts[0], Stmt::MonitorExit(_)) {
+        return None;
+    }
+
+    let mut items = top_level_items(body);
+    let last = items.pop()?;
+    match last {
+        StructuredStmt::Basic(mut stmts) => {
+            if !matches!(stmts.last(), Some(Stmt::MonitorExit(_))) {
+                return None;
+            }
+            stmts.pop();
+            if !stmts.is_empty() {
+                items.push(StructuredStmt::Basic(stmts));
+            }
+            Some(wrap_sequence(items))
+        }
+        _ => None,
+    }
+}
+
+fn top_level_items(stmt: StructuredStmt) -> Vec<StructuredStmt> {
+    match stmt {
+        StructuredStmt::Sequence(items) => items
+            .into_iter()
+            .filter(|item| !matches!(item, StructuredStmt::Empty))
+            .collect(),
+        other => vec![other],
+    }
+}
+
+fn extract_finally_from_handler(
+    stmt: StructuredStmt,
+) -> Result<(StructuredStmt, Option<u16>)> {
+    let (slot, without_binding) = extract_catch_binding_slot(stmt);
+    let without_throw = strip_terminal_rethrow(without_binding.clone(), slot).ok_or_else(|| {
+        DecompileError::Unsupported(format!(
+            "catch-all handler is not a canonical finally: {without_binding:?}"
+        ))
+    })?;
+    Ok((without_throw, slot))
+}
+
+fn extract_catch_binding_slot(stmt: StructuredStmt) -> (Option<u16>, StructuredStmt) {
+    match stmt {
+        StructuredStmt::Basic(mut stmts) => {
+            if let Some(Stmt::Assign {
+                target: StructuredExpr::Var(slot),
+                value: StructuredExpr::CaughtException(_),
+            }) = stmts.first()
+            {
+                let slot = *slot;
+                stmts.remove(0);
+                let body = if stmts.is_empty() {
+                    StructuredStmt::Empty
+                } else {
+                    StructuredStmt::Basic(stmts)
+                };
+                return (Some(slot), body);
+            }
+            (None, StructuredStmt::Basic(stmts))
+        }
+        StructuredStmt::Sequence(mut items) => {
+            while matches!(items.first(), Some(StructuredStmt::Empty)) {
+                items.remove(0);
+            }
+            if let Some(first) = items.first_mut() {
+                let (slot, rewritten) = extract_catch_binding_slot(first.clone());
+                *first = rewritten;
+                return (slot, wrap_sequence(items));
+            }
+            (None, StructuredStmt::Sequence(Vec::new()))
+        }
+        other => (None, other),
+    }
+}
+
+fn strip_terminal_rethrow(stmt: StructuredStmt, slot: Option<u16>) -> Option<StructuredStmt> {
+    match stmt {
+        StructuredStmt::Basic(mut stmts) => {
+            let should_strip = matches!(
+                stmts.last(),
+                Some(Stmt::Throw(StructuredExpr::Var(value_slot))) if slot == Some(*value_slot)
+            ) || matches!(stmts.last(), Some(Stmt::Throw(StructuredExpr::CaughtException(_))));
+            if !should_strip {
+                return None;
+            }
+            stmts.pop();
+            Some(if stmts.is_empty() {
+                StructuredStmt::Empty
+            } else {
+                StructuredStmt::Basic(stmts)
+            })
+        }
+        StructuredStmt::Sequence(mut items) => {
+            while matches!(items.last(), Some(StructuredStmt::Empty)) {
+                items.pop();
+            }
+            let last = items.pop()?;
+            let stripped = strip_terminal_rethrow(last, slot)?;
+            if !matches!(stripped, StructuredStmt::Empty) {
+                items.push(stripped);
+            }
+            Some(wrap_sequence(items))
+        }
+        _ => None,
+    }
+}
+
+fn remove_duplicate_finally(
+    method: &LoadedMethod,
+    body: StructuredStmt,
+    finally_body: &StructuredStmt,
+) -> Option<StructuredStmt> {
+    if let (StructuredStmt::Basic(body_stmts), StructuredStmt::Basic(finally_stmts)) =
+        (&body, finally_body)
+    {
+        let stripped = remove_stmt_subsequence(method, body_stmts, finally_stmts)?;
+        return Some(if stripped.is_empty() {
+            StructuredStmt::Empty
+        } else {
+            StructuredStmt::Basic(stripped)
+        });
+    }
+    let body_items = top_level_items(body);
+    let finally_items = top_level_items(finally_body.clone());
+    if finally_items.is_empty() {
+        return Some(wrap_sequence(body_items));
+    }
+    if body_items.len() < finally_items.len() {
+        return None;
+    }
+    for start in (0..=body_items.len() - finally_items.len()).rev() {
+        if statement_slice_equivalent(
+            method,
+            &body_items[start..start + finally_items.len()],
+            &finally_items,
+        ) {
+            let mut stripped = body_items.clone();
+            stripped.drain(start..start + finally_items.len());
+            return Some(wrap_sequence(stripped));
+        }
+    }
+    None
+}
+
+fn remove_stmt_subsequence(
+    method: &LoadedMethod,
+    body: &[Stmt],
+    finally_body: &[Stmt],
+) -> Option<Vec<Stmt>> {
+    if finally_body.is_empty() {
+        return Some(body.to_vec());
+    }
+    if body.len() < finally_body.len() {
+        return None;
+    }
+    for start in (0..=body.len() - finally_body.len()).rev() {
+        let mut slot_map = std::collections::HashMap::new();
+        let mut reverse_slot_map = std::collections::HashMap::new();
+        let mut temp_map = std::collections::HashMap::new();
+        let mut reverse_temp_map = std::collections::HashMap::new();
+        let matched = body[start..start + finally_body.len()]
+            .iter()
+            .zip(finally_body.iter())
+            .all(|(left, right)| {
+                stmt_item_equivalent(
+                    method,
+                    left,
+                    right,
+                    &mut slot_map,
+                    &mut reverse_slot_map,
+                    &mut temp_map,
+                    &mut reverse_temp_map,
+                )
+            });
+        if matched {
+            let mut stripped = body.to_vec();
+            stripped.drain(start..start + finally_body.len());
+            return Some(stripped);
+        }
+    }
+    None
+}
+
+fn is_monitor_only_finally(finally_body: &StructuredStmt) -> bool {
+    let items = top_level_items(finally_body.clone());
+    items.len() == 1
+        && matches!(
+            &items[0],
+            StructuredStmt::Basic(stmts)
+                if stmts.len() == 1 && matches!(stmts[0], Stmt::MonitorExit(_))
+        )
+}
+
+fn statement_slice_equivalent(
+    method: &LoadedMethod,
+    left: &[StructuredStmt],
+    right: &[StructuredStmt],
+) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut slot_map = std::collections::HashMap::new();
+    let mut reverse_slot_map = std::collections::HashMap::new();
+    let mut temp_map = std::collections::HashMap::new();
+    let mut reverse_temp_map = std::collections::HashMap::new();
+    left.iter().zip(right.iter()).all(|(left, right)| {
+        stmt_equivalent(
+            method,
+            left,
+            right,
+            &mut slot_map,
+            &mut reverse_slot_map,
+            &mut temp_map,
+            &mut reverse_temp_map,
+        )
+    })
+}
+
+fn stmt_equivalent(
+    method: &LoadedMethod,
+    left: &StructuredStmt,
+    right: &StructuredStmt,
+    slot_map: &mut std::collections::HashMap<u16, u16>,
+    reverse_slot_map: &mut std::collections::HashMap<u16, u16>,
+    temp_map: &mut std::collections::HashMap<u32, u32>,
+    reverse_temp_map: &mut std::collections::HashMap<u32, u32>,
+) -> bool {
+    match (left, right) {
+        (StructuredStmt::Empty, StructuredStmt::Empty) => true,
+        (StructuredStmt::Basic(left), StructuredStmt::Basic(right)) => {
+            if left.len() != right.len() {
+                return false;
+            }
+            left.iter().zip(right.iter()).all(|(left, right)| {
+                stmt_item_equivalent(
+                    method,
+                    left,
+                    right,
+                    slot_map,
+                    reverse_slot_map,
+                    temp_map,
+                    reverse_temp_map,
+                )
+            })
+        }
+        (StructuredStmt::Sequence(left), StructuredStmt::Sequence(right)) => {
+            statement_slice_equivalent(method, left, right)
+        }
+        (
+            StructuredStmt::If {
+                condition: left_condition,
+                then_branch: left_then,
+                else_branch: left_else,
+            },
+            StructuredStmt::If {
+                condition: right_condition,
+                then_branch: right_then,
+                else_branch: right_else,
+            },
+        ) => {
+            expr_equivalent(
+                method,
+                left_condition,
+                right_condition,
+                slot_map,
+                reverse_slot_map,
+                temp_map,
+                reverse_temp_map,
+            ) && stmt_equivalent(
+                method,
+                left_then,
+                right_then,
+                slot_map,
+                reverse_slot_map,
+                temp_map,
+                reverse_temp_map,
+            ) && match (left_else, right_else) {
+                (None, None) => true,
+                (Some(left), Some(right)) => stmt_equivalent(
+                    method,
+                    left,
+                    right,
+                    slot_map,
+                    reverse_slot_map,
+                    temp_map,
+                    reverse_temp_map,
+                ),
+                _ => false,
+            }
+        }
+        (
+            StructuredStmt::While {
+                condition: left_condition,
+                body: left_body,
+            },
+            StructuredStmt::While {
+                condition: right_condition,
+                body: right_body,
+            },
+        ) => {
+            expr_equivalent(
+                method,
+                left_condition,
+                right_condition,
+                slot_map,
+                reverse_slot_map,
+                temp_map,
+                reverse_temp_map,
+            ) && stmt_equivalent(
+                method,
+                left_body,
+                right_body,
+                slot_map,
+                reverse_slot_map,
+                temp_map,
+                reverse_temp_map,
+            )
+        }
+        (StructuredStmt::Comment(left), StructuredStmt::Comment(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn stmt_item_equivalent(
+    method: &LoadedMethod,
+    left: &Stmt,
+    right: &Stmt,
+    slot_map: &mut std::collections::HashMap<u16, u16>,
+    reverse_slot_map: &mut std::collections::HashMap<u16, u16>,
+    temp_map: &mut std::collections::HashMap<u32, u32>,
+    reverse_temp_map: &mut std::collections::HashMap<u32, u32>,
+) -> bool {
+    match (left, right) {
+        (
+            Stmt::Assign {
+                target: left_target,
+                value: left_value,
+            },
+            Stmt::Assign {
+                target: right_target,
+                value: right_value,
+            },
+        ) => {
+            expr_equivalent(
+                method,
+                left_target,
+                right_target,
+                slot_map,
+                reverse_slot_map,
+                temp_map,
+                reverse_temp_map,
+            ) && expr_equivalent(
+                method,
+                left_value,
+                right_value,
+                slot_map,
+                reverse_slot_map,
+                temp_map,
+                reverse_temp_map,
+            )
+        }
+        (
+            Stmt::TempAssign {
+                id: left_id,
+                ty: left_ty,
+                value: left_value,
+            },
+            Stmt::TempAssign {
+                id: right_id,
+                ty: right_ty,
+                value: right_value,
+            },
+        ) => {
+            left_ty == right_ty
+                && map_temp(left_id, right_id, temp_map, reverse_temp_map)
+                && expr_equivalent(
+                    method,
+                    left_value,
+                    right_value,
+                    slot_map,
+                    reverse_slot_map,
+                    temp_map,
+                    reverse_temp_map,
+                )
+        }
+        (Stmt::Expr(left), Stmt::Expr(right))
+        | (Stmt::Throw(left), Stmt::Throw(right))
+        | (Stmt::MonitorEnter(left), Stmt::MonitorEnter(right))
+        | (Stmt::MonitorExit(left), Stmt::MonitorExit(right)) => expr_equivalent(
+            method,
+            left,
+            right,
+            slot_map,
+            reverse_slot_map,
+            temp_map,
+            reverse_temp_map,
+        ),
+        (Stmt::Break, Stmt::Break) => true,
+        (Stmt::Return(left), Stmt::Return(right)) => match (left, right) {
+            (None, None) => true,
+            (Some(left), Some(right)) => expr_equivalent(
+                method,
+                left,
+                right,
+                slot_map,
+                reverse_slot_map,
+                temp_map,
+                reverse_temp_map,
+            ),
+            _ => false,
+        },
+        (
+            Stmt::ConstructorCall {
+                is_super: left_super,
+                args: left_args,
+            },
+            Stmt::ConstructorCall {
+                is_super: right_super,
+                args: right_args,
+            },
+        ) => {
+            left_super == right_super
+                && left_args.len() == right_args.len()
+                && left_args.iter().zip(right_args.iter()).all(|(left, right)| {
+                    expr_equivalent(
+                        method,
+                        left,
+                        right,
+                        slot_map,
+                        reverse_slot_map,
+                        temp_map,
+                        reverse_temp_map,
+                    )
+                })
+        }
+        (Stmt::Comment(left), Stmt::Comment(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn expr_equivalent(
+    method: &LoadedMethod,
+    left: &StructuredExpr,
+    right: &StructuredExpr,
+    slot_map: &mut std::collections::HashMap<u16, u16>,
+    reverse_slot_map: &mut std::collections::HashMap<u16, u16>,
+    temp_map: &mut std::collections::HashMap<u32, u32>,
+    reverse_temp_map: &mut std::collections::HashMap<u32, u32>,
+) -> bool {
+    match (left, right) {
+        (StructuredExpr::This, StructuredExpr::This) => true,
+        (StructuredExpr::Var(left), StructuredExpr::Var(right)) => {
+            map_slot(method, *left, *right, slot_map, reverse_slot_map)
+        }
+        (StructuredExpr::Temp(left), StructuredExpr::Temp(right)) => {
+            map_temp(left, right, temp_map, reverse_temp_map)
+        }
+        (StructuredExpr::CaughtException(_), StructuredExpr::CaughtException(_)) => true,
+        (StructuredExpr::Literal(left), StructuredExpr::Literal(right)) => left == right,
+        (
+            StructuredExpr::Field {
+                target: left_target,
+                owner: left_owner,
+                name: left_name,
+                descriptor: left_descriptor,
+                is_static: left_static,
+            },
+            StructuredExpr::Field {
+                target: right_target,
+                owner: right_owner,
+                name: right_name,
+                descriptor: right_descriptor,
+                is_static: right_static,
+            },
+        ) => {
+            left_owner == right_owner
+                && left_name == right_name
+                && left_descriptor == right_descriptor
+                && left_static == right_static
+                && match (left_target, right_target) {
+                    (None, None) => true,
+                    (Some(left), Some(right)) => expr_equivalent(
+                        method,
+                        left,
+                        right,
+                        slot_map,
+                        reverse_slot_map,
+                        temp_map,
+                        reverse_temp_map,
+                    ),
+                    _ => false,
+                }
+        }
+        (
+            StructuredExpr::ArrayAccess {
+                array: left_array,
+                index: left_index,
+            },
+            StructuredExpr::ArrayAccess {
+                array: right_array,
+                index: right_index,
+            },
+        ) => {
+            expr_equivalent(
+                method,
+                left_array,
+                right_array,
+                slot_map,
+                reverse_slot_map,
+                temp_map,
+                reverse_temp_map,
+            ) && expr_equivalent(
+                method,
+                left_index,
+                right_index,
+                slot_map,
+                reverse_slot_map,
+                temp_map,
+                reverse_temp_map,
+            )
+        }
+        (StructuredExpr::ArrayLength(left), StructuredExpr::ArrayLength(right)) => expr_equivalent(
+            method,
+            left,
+            right,
+            slot_map,
+            reverse_slot_map,
+            temp_map,
+            reverse_temp_map,
+        ),
+        (
+            StructuredExpr::Binary {
+                op: left_op,
+                left: left_left,
+                right: left_right,
+            },
+            StructuredExpr::Binary {
+                op: right_op,
+                left: right_left,
+                right: right_right,
+            },
+        ) => {
+            left_op == right_op
+                && expr_equivalent(
+                    method,
+                    left_left,
+                    right_left,
+                    slot_map,
+                    reverse_slot_map,
+                    temp_map,
+                    reverse_temp_map,
+                )
+                && expr_equivalent(
+                    method,
+                    left_right,
+                    right_right,
+                    slot_map,
+                    reverse_slot_map,
+                    temp_map,
+                    reverse_temp_map,
+                )
+        }
+        (
+            StructuredExpr::Unary {
+                op: left_op,
+                expr: left_expr,
+            },
+            StructuredExpr::Unary {
+                op: right_op,
+                expr: right_expr,
+            },
+        ) => {
+            left_op == right_op
+                && expr_equivalent(
+                    method,
+                    left_expr,
+                    right_expr,
+                    slot_map,
+                    reverse_slot_map,
+                    temp_map,
+                    reverse_temp_map,
+                )
+        }
+        (
+            StructuredExpr::Call {
+                receiver: left_receiver,
+                owner: left_owner,
+                name: left_name,
+                descriptor: left_descriptor,
+                args: left_args,
+                is_static: left_static,
+            },
+            StructuredExpr::Call {
+                receiver: right_receiver,
+                owner: right_owner,
+                name: right_name,
+                descriptor: right_descriptor,
+                args: right_args,
+                is_static: right_static,
+            },
+        ) => {
+            left_owner == right_owner
+                && left_name == right_name
+                && left_descriptor == right_descriptor
+                && left_static == right_static
+                && left_args.len() == right_args.len()
+                && match (left_receiver, right_receiver) {
+                    (None, None) => true,
+                    (Some(left), Some(right)) => expr_equivalent(
+                        method,
+                        left,
+                        right,
+                        slot_map,
+                        reverse_slot_map,
+                        temp_map,
+                        reverse_temp_map,
+                    ),
+                    _ => false,
+                }
+                && left_args.iter().zip(right_args.iter()).all(|(left, right)| {
+                    expr_equivalent(
+                        method,
+                        left,
+                        right,
+                        slot_map,
+                        reverse_slot_map,
+                        temp_map,
+                        reverse_temp_map,
+                    )
+                })
+        }
+        (
+            StructuredExpr::New {
+                class_name: left_class,
+                args: left_args,
+            },
+            StructuredExpr::New {
+                class_name: right_class,
+                args: right_args,
+            },
+        ) => {
+            left_class == right_class
+                && left_args.len() == right_args.len()
+                && left_args.iter().zip(right_args.iter()).all(|(left, right)| {
+                    expr_equivalent(
+                        method,
+                        left,
+                        right,
+                        slot_map,
+                        reverse_slot_map,
+                        temp_map,
+                        reverse_temp_map,
+                    )
+                })
+        }
+        (
+            StructuredExpr::NewArray {
+                element_type: left_type,
+                size: left_size,
+            },
+            StructuredExpr::NewArray {
+                element_type: right_type,
+                size: right_size,
+            },
+        ) => {
+            left_type == right_type
+                && expr_equivalent(
+                    method,
+                    left_size,
+                    right_size,
+                    slot_map,
+                    reverse_slot_map,
+                    temp_map,
+                    reverse_temp_map,
+                )
+        }
+        (
+            StructuredExpr::Cast {
+                ty: left_ty,
+                expr: left_expr,
+            },
+            StructuredExpr::Cast {
+                ty: right_ty,
+                expr: right_expr,
+            },
+        ) => {
+            left_ty == right_ty
+                && expr_equivalent(
+                    method,
+                    left_expr,
+                    right_expr,
+                    slot_map,
+                    reverse_slot_map,
+                    temp_map,
+                    reverse_temp_map,
+                )
+        }
+        (
+            StructuredExpr::InstanceOf {
+                expr: left_expr,
+                ty: left_ty,
+            },
+            StructuredExpr::InstanceOf {
+                expr: right_expr,
+                ty: right_ty,
+            },
+        ) => {
+            left_ty == right_ty
+                && expr_equivalent(
+                    method,
+                    left_expr,
+                    right_expr,
+                    slot_map,
+                    reverse_slot_map,
+                    temp_map,
+                    reverse_temp_map,
+                )
+        }
+        _ => false,
+    }
+}
+
+fn map_slot(
+    method: &LoadedMethod,
+    left: u16,
+    right: u16,
+    slot_map: &mut std::collections::HashMap<u16, u16>,
+    reverse_slot_map: &mut std::collections::HashMap<u16, u16>,
+) -> bool {
+    let is_stable_left = stable_slot(method, left);
+    let is_stable_right = stable_slot(method, right);
+    if is_stable_left || is_stable_right {
+        return left == right;
+    }
+    match slot_map.get(&left) {
+        Some(mapped) => *mapped == right,
+        None => {
+            if reverse_slot_map.insert(right, left).is_some() {
+                return false;
+            }
+            slot_map.insert(left, right);
+            true
+        }
+    }
+}
+
+fn map_temp(
+    left: &u32,
+    right: &u32,
+    temp_map: &mut std::collections::HashMap<u32, u32>,
+    reverse_temp_map: &mut std::collections::HashMap<u32, u32>,
+) -> bool {
+    match temp_map.get(left) {
+        Some(mapped) => *mapped == *right,
+        None => {
+            if reverse_temp_map.insert(*right, *left).is_some() {
+                return false;
+            }
+            temp_map.insert(*left, *right);
+            true
+        }
+    }
+}
+
+fn stable_slot(method: &LoadedMethod, slot: u16) -> bool {
+    (!method.is_static() && slot == 0)
+        || method.parameters.iter().any(|parameter| parameter.slot == slot)
+}
+
+fn try_rewrite_synchronized(
+    _method: &LoadedMethod,
+    try_body: &StructuredStmt,
+    finally_body: &StructuredStmt,
+    _catch_slot: Option<u16>,
+) -> Option<(StructuredExpr, StructuredStmt)> {
+    let try_items = top_level_items(try_body.clone());
+    let first = try_items.first()?;
+    let StructuredStmt::Basic(first_stmts) = first else {
+        return None;
+    };
+
+    let (monitor_expr, consumed_from_first) = match first_stmts.as_slice() {
+        [Stmt::Assign {
+            target: StructuredExpr::Var(_slot),
+            value,
+        }, Stmt::MonitorEnter(expr), ..] if expr == value => (value.clone(), 2),
+        [Stmt::Assign {
+            target: StructuredExpr::Var(_slot),
+            value,
+        }, Stmt::MonitorEnter(_), ..] => (value.clone(), 2),
+        [Stmt::MonitorEnter(expr), ..] => (expr.clone(), 1),
+        _ => return None,
+    };
+
+    let finally_items = top_level_items(finally_body.clone());
+    if finally_items.len() != 1 {
+        return None;
+    }
+    let StructuredStmt::Basic(finally_stmts) = &finally_items[0] else {
+        return None;
+    };
+    if finally_stmts.len() != 1 {
+        return None;
+    }
+    if !matches!(&finally_stmts[0], Stmt::MonitorExit(_)) {
+        return None;
+    }
+
+    let mut body_items = try_items;
+    let StructuredStmt::Basic(mut first_stmts_owned) = body_items.remove(0) else {
+        return None;
+    };
+    first_stmts_owned.drain(0..consumed_from_first);
+    if !first_stmts_owned.is_empty() {
+        body_items.insert(0, StructuredStmt::Basic(first_stmts_owned));
+    }
+    Some((monitor_expr, wrap_sequence(body_items)))
 }
 
 fn strip_try_comments(stmt: StructuredStmt) -> StructuredStmt {
@@ -802,7 +1987,11 @@ fn strip_try_comments(stmt: StructuredStmt) -> StructuredStmt {
                 })
                 .collect(),
         },
-        StructuredStmt::TryCatch { try_body, catches } => StructuredStmt::TryCatch {
+        StructuredStmt::Try {
+            try_body,
+            catches,
+            finally_body,
+        } => StructuredStmt::Try {
             try_body: Box::new(strip_try_comments(*try_body)),
             catches: catches
                 .into_iter()
@@ -812,6 +2001,11 @@ fn strip_try_comments(stmt: StructuredStmt) -> StructuredStmt {
                     body: Box::new(strip_try_comments(*catch.body)),
                 })
                 .collect(),
+            finally_body: finally_body.map(|body| Box::new(strip_try_comments(*body))),
+        },
+        StructuredStmt::Synchronized { expr, body } => StructuredStmt::Synchronized {
+            expr,
+            body: Box::new(strip_try_comments(*body)),
         },
         other => other,
     }

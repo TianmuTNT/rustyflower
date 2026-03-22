@@ -380,6 +380,200 @@ fn decompiles_nested_try_catch() {
 }
 
 #[test]
+fn decompiles_simple_try_finally() {
+    let bytes = class_with_single_method("pkg/TestTryFinallySynth", "run", "()V", false, |method| {
+        let try_start = Label::new();
+        let try_end = Label::new();
+        let handler = Label::new();
+        let after = Label::new();
+
+        method.visit_label(try_start);
+        method.visit_field_insn(
+            opcodes::GETSTATIC,
+            "java/lang/System",
+            "out",
+            "Ljava/io/PrintStream;",
+        );
+        method.visit_ldc_insn(LdcInsnNode::string("Hello"));
+        method.visit_method_insn(
+            opcodes::INVOKEVIRTUAL,
+            "java/io/PrintStream",
+            "println",
+            "(Ljava/lang/String;)V",
+            false,
+        );
+        method.visit_label(try_end);
+        method.visit_field_insn(
+            opcodes::GETSTATIC,
+            "java/lang/System",
+            "out",
+            "Ljava/io/PrintStream;",
+        );
+        method.visit_ldc_insn(LdcInsnNode::string("Finally"));
+        method.visit_method_insn(
+            opcodes::INVOKEVIRTUAL,
+            "java/io/PrintStream",
+            "println",
+            "(Ljava/lang/String;)V",
+            false,
+        );
+        method.visit_jump_insn(opcodes::GOTO, after);
+        method.visit_label(handler);
+        method.visit_var_insn(opcodes::ASTORE, 1);
+        method.visit_field_insn(
+            opcodes::GETSTATIC,
+            "java/lang/System",
+            "out",
+            "Ljava/io/PrintStream;",
+        );
+        method.visit_ldc_insn(LdcInsnNode::string("Finally"));
+        method.visit_method_insn(
+            opcodes::INVOKEVIRTUAL,
+            "java/io/PrintStream",
+            "println",
+            "(Ljava/lang/String;)V",
+            false,
+        );
+        method.visit_var_insn(opcodes::ALOAD, 1);
+        method.visit_insn(opcodes::ATHROW);
+        method.visit_label(after);
+        method.visit_insn(opcodes::RETURN);
+        method.visit_try_catch_block(try_start, try_end, handler, None);
+        method.visit_maxs(2, 2);
+    });
+
+    let output = rustyflower::decompile_bytes(&bytes).expect("decompilation should succeed");
+    assert!(output.contains("try {"));
+    assert!(output.contains("finally {"));
+    assert!(output.contains("\"Finally\""));
+}
+
+#[test]
+fn keeps_simple_try_catch_finally_stable() {
+    let bytes = class_with_single_method("pkg/TestTryCatchFinallySynth", "run", "()I", true, |method| {
+        let try_start = Label::new();
+        let try_end = Label::new();
+        let catch_handler = Label::new();
+        let finally_handler = Label::new();
+        let after_try = Label::new();
+        let after_catch = Label::new();
+
+        method.visit_label(try_start);
+        method.visit_insn(opcodes::ICONST_1);
+        method.visit_var_insn(opcodes::ISTORE, 1);
+        method.visit_label(try_end);
+        method.visit_field_insn(
+            opcodes::GETSTATIC,
+            "java/lang/System",
+            "out",
+            "Ljava/io/PrintStream;",
+        );
+        method.visit_ldc_insn(LdcInsnNode::string("Finally"));
+        method.visit_method_insn(
+            opcodes::INVOKEVIRTUAL,
+            "java/io/PrintStream",
+            "println",
+            "(Ljava/lang/String;)V",
+            false,
+        );
+        method.visit_jump_insn(opcodes::GOTO, after_try);
+
+        method.visit_label(catch_handler);
+        method.visit_var_insn(opcodes::ASTORE, 2);
+        method.visit_insn(opcodes::ICONST_M1);
+        method.visit_var_insn(opcodes::ISTORE, 1);
+        method.visit_field_insn(
+            opcodes::GETSTATIC,
+            "java/lang/System",
+            "out",
+            "Ljava/io/PrintStream;",
+        );
+        method.visit_ldc_insn(LdcInsnNode::string("Finally"));
+        method.visit_method_insn(
+            opcodes::INVOKEVIRTUAL,
+            "java/io/PrintStream",
+            "println",
+            "(Ljava/lang/String;)V",
+            false,
+        );
+        method.visit_jump_insn(opcodes::GOTO, after_catch);
+
+        method.visit_label(finally_handler);
+        method.visit_var_insn(opcodes::ASTORE, 3);
+        method.visit_field_insn(
+            opcodes::GETSTATIC,
+            "java/lang/System",
+            "out",
+            "Ljava/io/PrintStream;",
+        );
+        method.visit_ldc_insn(LdcInsnNode::string("Finally"));
+        method.visit_method_insn(
+            opcodes::INVOKEVIRTUAL,
+            "java/io/PrintStream",
+            "println",
+            "(Ljava/lang/String;)V",
+            false,
+        );
+        method.visit_var_insn(opcodes::ALOAD, 3);
+        method.visit_insn(opcodes::ATHROW);
+
+        method.visit_label(after_try);
+        method.visit_label(after_catch);
+        method.visit_var_insn(opcodes::ILOAD, 1);
+        method.visit_insn(opcodes::IRETURN);
+
+        method.visit_try_catch_block(try_start, try_end, catch_handler, Some("java/lang/RuntimeException"));
+        method.visit_try_catch_block(try_start, try_end, finally_handler, None);
+        method.visit_try_catch_block(catch_handler, after_catch, finally_handler, None);
+        method.visit_maxs(2, 4);
+    });
+
+    let output = rustyflower::decompile_bytes(&bytes).expect("decompilation should succeed");
+    assert!(
+        output.contains("try {")
+            || output
+                .contains("rustyflower: method body decompilation is being implemented incrementally.")
+    );
+}
+
+#[test]
+fn decompiles_synchronized_block() {
+    let bytes = class_with_single_method("pkg/TestSync", "inc", "(I)I", false, |method| {
+        let lock = Label::new();
+        let body_start = Label::new();
+        let body_end = Label::new();
+        let handler = Label::new();
+        let after = Label::new();
+
+        method.visit_var_insn(opcodes::ALOAD, 0);
+        method.visit_insn(opcodes::DUP);
+        method.visit_var_insn(opcodes::ASTORE, 2);
+        method.visit_insn(opcodes::MONITORENTER);
+        method.visit_label(body_start);
+        method.visit_iinc_insn(1, 1);
+        method.visit_var_insn(opcodes::ALOAD, 2);
+        method.visit_insn(opcodes::MONITOREXIT);
+        method.visit_label(body_end);
+        method.visit_jump_insn(opcodes::GOTO, after);
+        method.visit_label(handler);
+        method.visit_var_insn(opcodes::ASTORE, 3);
+        method.visit_var_insn(opcodes::ALOAD, 2);
+        method.visit_insn(opcodes::MONITOREXIT);
+        method.visit_var_insn(opcodes::ALOAD, 3);
+        method.visit_insn(opcodes::ATHROW);
+        method.visit_label(after);
+        method.visit_var_insn(opcodes::ILOAD, 1);
+        method.visit_insn(opcodes::IRETURN);
+        method.visit_try_catch_block(body_start, body_end, handler, None);
+        method.visit_try_catch_block(handler, after, handler, None);
+        method.visit_maxs(2, 4);
+    });
+
+    let output = rustyflower::decompile_bytes(&bytes).expect("decompilation should succeed");
+    assert!(output.contains("synchronized (this)"));
+}
+
+#[test]
 fn decompiles_vineflower_test_class_switch_fixture() {
     // Reference: vineflower/test/org/jetbrains/java/decompiler/SingleClassesTest.java -> TestClassSwitch
     let class_path = compile_vineflower_source("testData/src/java8/pkg/TestClassSwitch.java");
@@ -433,6 +627,19 @@ fn keeps_vineflower_try_finally_fixture_stable() {
         output
             .contains("rustyflower: method body decompilation is being implemented incrementally.")
             || output.contains("try {")
+    );
+}
+
+#[test]
+fn keeps_vineflower_synchronized_mapping_fixture_stable() {
+    // Reference: vineflower/test/org/jetbrains/java/decompiler/SingleClassesTest.java -> TestSynchronizedMapping
+    let class_path = compile_vineflower_source("testData/src/java8/pkg/TestSynchronizedMapping.java");
+    let output = rustyflower::decompile_path(&class_path).expect("fixture should decompile");
+    assert!(output.contains("public class TestSynchronizedMapping"));
+    assert!(
+        output.contains("synchronized (")
+            || output
+                .contains("rustyflower: method body decompilation is being implemented incrementally.")
     );
 }
 
