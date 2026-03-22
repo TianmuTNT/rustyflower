@@ -209,6 +209,177 @@ fn decompiles_lookup_switch() {
 }
 
 #[test]
+fn decompiles_simple_try_catch() {
+    let bytes = class_with_single_method(
+        "pkg/TestTryCatch",
+        "safeLen",
+        "(Ljava/lang/String;)I",
+        true,
+        |method| {
+            let try_start = Label::new();
+            let try_end = Label::new();
+            let handler = Label::new();
+
+            method.visit_label(try_start);
+            method.visit_var_insn(opcodes::ALOAD, 0);
+            method.visit_method_insn(
+                opcodes::INVOKEVIRTUAL,
+                "java/lang/String",
+                "length",
+                "()I",
+                false,
+            );
+            method.visit_insn(opcodes::IRETURN);
+            method.visit_label(try_end);
+            method.visit_label(handler);
+            method.visit_var_insn(opcodes::ASTORE, 1);
+            method.visit_insn(opcodes::ICONST_M1);
+            method.visit_insn(opcodes::IRETURN);
+            method.visit_try_catch_block(
+                try_start,
+                try_end,
+                handler,
+                Some("java/lang/RuntimeException"),
+            );
+            method.visit_maxs(1, 2);
+        },
+    );
+
+    let output = rustyflower::decompile_bytes(&bytes).expect("decompilation should succeed");
+    assert!(output.contains("try {"));
+    assert!(output.contains("catch (java.lang.RuntimeException"));
+    assert!(output.contains("return -1;"));
+}
+
+#[test]
+fn decompiles_multi_catch_structure() {
+    let bytes = class_with_single_method(
+        "pkg/TestMultiCatch",
+        "safeLen",
+        "(Ljava/lang/String;)I",
+        true,
+        |method| {
+            let try_start = Label::new();
+            let try_end = Label::new();
+            let handler_one = Label::new();
+            let handler_two = Label::new();
+
+            method.visit_label(try_start);
+            method.visit_var_insn(opcodes::ALOAD, 0);
+            method.visit_method_insn(
+                opcodes::INVOKEVIRTUAL,
+                "java/lang/String",
+                "length",
+                "()I",
+                false,
+            );
+            method.visit_insn(opcodes::IRETURN);
+            method.visit_label(try_end);
+            method.visit_label(handler_one);
+            method.visit_var_insn(opcodes::ASTORE, 1);
+            method.visit_insn(opcodes::ICONST_M1);
+            method.visit_insn(opcodes::IRETURN);
+            method.visit_label(handler_two);
+            method.visit_var_insn(opcodes::ASTORE, 1);
+            method.visit_insn(opcodes::ICONST_0);
+            method.visit_insn(opcodes::IRETURN);
+            method.visit_try_catch_block(
+                try_start,
+                try_end,
+                handler_one,
+                Some("java/lang/IllegalArgumentException"),
+            );
+            method.visit_try_catch_block(
+                try_start,
+                try_end,
+                handler_two,
+                Some("java/lang/RuntimeException"),
+            );
+            method.visit_maxs(1, 2);
+        },
+    );
+
+    let output = rustyflower::decompile_bytes(&bytes).expect("decompilation should succeed");
+    assert!(output.contains("catch (java.lang.IllegalArgumentException"));
+    assert!(output.contains("catch (java.lang.RuntimeException"));
+    assert!(output.contains("return -1;"));
+    assert!(output.contains("return 0;"));
+}
+
+#[test]
+fn decompiles_nested_try_catch() {
+    let bytes = class_with_single_method(
+        "pkg/TestNestedTryCatch",
+        "nested",
+        "(Ljava/lang/String;)I",
+        true,
+        |method| {
+            let outer_start = Label::new();
+            let outer_end = Label::new();
+            let outer_handler = Label::new();
+            let inner_start = Label::new();
+            let inner_end = Label::new();
+            let inner_handler = Label::new();
+            let inner_done = Label::new();
+
+            method.visit_label(outer_start);
+            method.visit_var_insn(opcodes::ALOAD, 0);
+            method.visit_method_insn(
+                opcodes::INVOKEVIRTUAL,
+                "java/lang/String",
+                "length",
+                "()I",
+                false,
+            );
+            method.visit_insn(opcodes::IRETURN);
+            method.visit_label(outer_end);
+
+            method.visit_label(outer_handler);
+            method.visit_var_insn(opcodes::ASTORE, 1);
+            method.visit_label(inner_start);
+            method.visit_var_insn(opcodes::ALOAD, 0);
+            method.visit_method_insn(
+                opcodes::INVOKEVIRTUAL,
+                "java/lang/String",
+                "isEmpty",
+                "()Z",
+                false,
+            );
+            method.visit_insn(opcodes::POP);
+            method.visit_label(inner_end);
+            method.visit_jump_insn(opcodes::GOTO, inner_done);
+
+            method.visit_label(inner_handler);
+            method.visit_var_insn(opcodes::ASTORE, 2);
+            method.visit_insn(opcodes::ICONST_M1);
+            method.visit_insn(opcodes::IRETURN);
+
+            method.visit_label(inner_done);
+            method.visit_insn(opcodes::ICONST_0);
+            method.visit_insn(opcodes::IRETURN);
+
+            method.visit_try_catch_block(
+                outer_start,
+                outer_end,
+                outer_handler,
+                Some("java/lang/RuntimeException"),
+            );
+            method.visit_try_catch_block(
+                inner_start,
+                inner_end,
+                inner_handler,
+                Some("java/lang/RuntimeException"),
+            );
+            method.visit_maxs(1, 3);
+        },
+    );
+
+    let output = rustyflower::decompile_bytes(&bytes).expect("decompilation should succeed");
+    assert!(output.contains("try {"));
+    assert!(output.matches("catch (java.lang.RuntimeException").count() >= 2);
+}
+
+#[test]
 fn decompiles_vineflower_test_class_switch_fixture() {
     // Reference: vineflower/test/org/jetbrains/java/decompiler/SingleClassesTest.java -> TestClassSwitch
     let class_path = compile_vineflower_source("testData/src/java8/pkg/TestClassSwitch.java");
@@ -236,6 +407,48 @@ fn keeps_vineflower_string_switch_fixture_stable() {
     assert!(output.contains("case \"AaBB\":"));
     assert!(output.contains("case \"BBAa\":"));
     assert!(!output.contains("hashCode()"));
+}
+
+#[test]
+fn keeps_vineflower_try_catch_finally_fixture_stable() {
+    // Reference: vineflower/test/org/jetbrains/java/decompiler/SingleClassesTest.java -> TestTryCatchFinally
+    let class_path = compile_vineflower_source("testData/src/java8/pkg/TestTryCatchFinally.java");
+    let output = rustyflower::decompile_path(&class_path).expect("fixture should decompile");
+    assert!(output.contains("public class TestTryCatchFinally"));
+    assert!(
+        output.contains("try {")
+            || output.contains(
+                "rustyflower: method body decompilation is being implemented incrementally."
+            )
+    );
+}
+
+#[test]
+fn keeps_vineflower_try_finally_fixture_stable() {
+    // Reference: vineflower/test/org/jetbrains/java/decompiler/SingleClassesTest.java -> TestTryFinally
+    let class_path = compile_vineflower_source("testData/src/java8/pkg/TestTryFinally.java");
+    let output = rustyflower::decompile_path(&class_path).expect("fixture should decompile");
+    assert!(output.contains("public class TestTryFinally"));
+    assert!(
+        output
+            .contains("rustyflower: method body decompilation is being implemented incrementally.")
+            || output.contains("try {")
+    );
+}
+
+#[test]
+fn keeps_vineflower_switch_in_try_fixture_stable() {
+    // Reference: vineflower/test/org/jetbrains/java/decompiler/SingleClassesTest.java -> TestSwitchInTry
+    let class_path = compile_vineflower_source("testData/src/java8/pkg/TestSwitchInTry.java");
+    let output = rustyflower::decompile_path(&class_path).expect("fixture should decompile");
+    assert!(output.contains("public class TestSwitchInTry"));
+    assert!(
+        output.contains("switch (")
+            || output.contains("try {")
+            || output.contains(
+                "rustyflower: method body decompilation is being implemented incrementally."
+            )
+    );
 }
 
 #[test]

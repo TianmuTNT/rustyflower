@@ -1,6 +1,6 @@
-use crate::bytecode::{resolve_field_ref, resolve_ldc, resolve_method_ref, ResolvedConstant};
+use crate::bytecode::{ResolvedConstant, resolve_field_ref, resolve_ldc, resolve_method_ref};
 use crate::expr::{Literal, Stmt, StructuredExpr};
-use crate::loader::{load_class, LoadedClass, LoadedMethod};
+use crate::loader::{LoadedClass, LoadedMethod, load_class};
 use crate::structure::{StructuredStmt, SwitchArm, SwitchLabel};
 use rust_asm::class_reader::ClassReader;
 use rust_asm::constant_pool::CpInfo;
@@ -25,7 +25,9 @@ impl ClassPathResolver {
     }
 
     pub fn load_class(&self, internal_name: &str) -> Option<LoadedClass> {
-        let path = self.root.join(format!("{}.class", internal_name.replace('/', "\\")));
+        let path = self
+            .root
+            .join(format!("{}.class", internal_name.replace('/', "\\")));
         let bytes = std::fs::read(path).ok()?;
         let class_node = ClassReader::new(&bytes).to_class_node().ok()?;
         load_class(class_node).ok()
@@ -40,9 +42,9 @@ pub fn lower_switches(
 ) -> StructuredStmt {
     let lowered = lower_stmt(class, method, stmt, resolver);
     match lowered {
-        StructuredStmt::Sequence(items) => StructuredStmt::Sequence(lower_sequence(
-            class, method, items, resolver,
-        )),
+        StructuredStmt::Sequence(items) => {
+            StructuredStmt::Sequence(lower_sequence(class, method, items, resolver))
+        }
         other => other,
     }
 }
@@ -64,11 +66,23 @@ fn lower_stmt(
         } => StructuredStmt::If {
             condition,
             then_branch: Box::new(lower_stmt(class, method, *then_branch, resolver)),
-            else_branch: else_branch.map(|branch| Box::new(lower_stmt(class, method, *branch, resolver))),
+            else_branch: else_branch
+                .map(|branch| Box::new(lower_stmt(class, method, *branch, resolver))),
         },
         StructuredStmt::While { condition, body } => StructuredStmt::While {
             condition,
             body: Box::new(lower_stmt(class, method, *body, resolver)),
+        },
+        StructuredStmt::TryCatch { try_body, catches } => StructuredStmt::TryCatch {
+            try_body: Box::new(lower_stmt(class, method, *try_body, resolver)),
+            catches: catches
+                .into_iter()
+                .map(|catch| crate::structure::CatchArm {
+                    catch_type: catch.catch_type,
+                    catch_var: catch.catch_var,
+                    body: Box::new(lower_stmt(class, method, *catch.body, resolver)),
+                })
+                .collect(),
         },
         StructuredStmt::Switch { expr, arms } => {
             let lowered_arms = arms
@@ -104,8 +118,7 @@ fn lower_sequence(
     let mut output = Vec::new();
     let mut index = 0;
     while index < lowered_items.len() {
-        if let Some((stmt, consumed)) =
-            lower_string_switch(class, method, &lowered_items[index..])
+        if let Some((stmt, consumed)) = lower_string_switch(class, method, &lowered_items[index..])
         {
             output.push(stmt);
             index += consumed;
@@ -201,10 +214,7 @@ fn lower_string_switch(
     let result = if residual_prefix.is_empty() {
         lowered_switch
     } else {
-        StructuredStmt::Sequence(vec![
-            StructuredStmt::Basic(residual_prefix),
-            lowered_switch,
-        ])
+        StructuredStmt::Sequence(vec![StructuredStmt::Basic(residual_prefix), lowered_switch])
     };
     Some((result, 3))
 }
@@ -376,7 +386,10 @@ fn detect_enum_switch_map(
     enum_owner: &str,
 ) -> Option<HashMap<i32, String>> {
     let helper_class = resolver.load_class(helper_owner)?;
-    let clinit = helper_class.methods.iter().find(|method| method.name == "<clinit>")?;
+    let clinit = helper_class
+        .methods
+        .iter()
+        .find(|method| method.name == "<clinit>")?;
     let mut mapping = HashMap::new();
     let insns = &clinit.instructions;
     for index in 0..insns.len().saturating_sub(4) {

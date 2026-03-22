@@ -269,6 +269,23 @@ fn write_structured_stmt(
                 write_stmt(out, statement, indent, ctx);
             }
         }
+        StructuredStmt::TryCatch { try_body, catches } => {
+            let pad = "    ".repeat(indent);
+            let _ = writeln!(out, "{}try {{", pad);
+            write_structured_stmt(out, try_body, indent + 1, ctx);
+            let _ = writeln!(out, "{}}}", pad);
+            for catch in catches {
+                let _ = writeln!(
+                    out,
+                    "{}catch ({} {}) {{",
+                    pad,
+                    format_internal_name(&catch.catch_type),
+                    catch.catch_var
+                );
+                write_structured_stmt(out, &catch.body, indent + 1, ctx);
+                let _ = writeln!(out, "{}}}", pad);
+            }
+        }
         StructuredStmt::Switch { expr, arms } => {
             let pad = "    ".repeat(indent);
             let _ = writeln!(out, "{}switch ({}) {{", pad, render_expr(expr, ctx));
@@ -411,6 +428,7 @@ fn render_expr(expr: &StructuredExpr, ctx: &MethodWriteContext<'_>) -> String {
         StructuredExpr::This => "this".to_string(),
         StructuredExpr::Var(slot) => ctx.method.slot_name(*slot),
         StructuredExpr::Temp(id) => format!("tmp{id}"),
+        StructuredExpr::CaughtException(_) => "<caught-exception>".to_string(),
         StructuredExpr::Literal(literal) => render_literal(literal),
         StructuredExpr::Field {
             target,
@@ -539,6 +557,7 @@ fn infer_expr_type(expr: &StructuredExpr, ctx: &MethodWriteContext<'_>) -> Optio
         StructuredExpr::This => None,
         StructuredExpr::Var(slot) => ctx.method.slot_type(*slot),
         StructuredExpr::Temp(id) => ctx.temp_types.get(id).cloned(),
+        StructuredExpr::CaughtException(ty) => ty.clone(),
         StructuredExpr::Literal(literal) => Some(match literal {
             Literal::Null => return None,
             Literal::Boolean(_) => Type::Boolean,

@@ -1,6 +1,6 @@
 use crate::bytecode::{
-    ResolvedConstant, jump_target, resolve_field_ref, resolve_ldc, resolve_method_ref,
-    resolve_type_from_index,
+    ResolvedConstant, cp_class_name, jump_target, resolve_field_ref, resolve_ldc,
+    resolve_method_ref, resolve_type_from_index,
 };
 use crate::cfg::BasicBlock;
 use crate::error::{DecompileError, Result};
@@ -14,6 +14,7 @@ pub enum StructuredExpr {
     This,
     Var(u16),
     Temp(u32),
+    CaughtException(Option<Type>),
     Literal(Literal),
     Field {
         target: Option<Box<StructuredExpr>>,
@@ -257,6 +258,12 @@ pub fn translate_block(
     temp_counter: &mut u32,
 ) -> Result<BlockSemantics> {
     let mut translator = BlockTranslator::new(class, method, temp_counter);
+    if let Some(catch_type) = handler_entry_type(class, method, block.start_offset) {
+        translator.push_expr(
+            StructuredExpr::CaughtException(catch_type.clone()),
+            catch_type,
+        );
+    }
     for instruction_index in block.first_index..=block.last_index {
         let insn = &method.instructions[instruction_index];
         let offset = method.instruction_offsets[instruction_index];
@@ -1112,6 +1119,7 @@ fn is_safe_to_duplicate(expr: &StructuredExpr) -> bool {
         StructuredExpr::This
             | StructuredExpr::Var(_)
             | StructuredExpr::Temp(_)
+            | StructuredExpr::CaughtException(_)
             | StructuredExpr::Literal(_)
     )
 }
@@ -1151,4 +1159,24 @@ fn negate_binary_op(op: BinaryOp) -> BinaryOp {
         BinaryOp::Ge => BinaryOp::Lt,
         other => other,
     }
+}
+
+fn handler_entry_type(
+    class: &LoadedClass,
+    method: &LoadedMethod,
+    handler_pc: u16,
+) -> Option<Option<Type>> {
+    method
+        .exception_table
+        .iter()
+        .find(|entry| entry.handler_pc == handler_pc)
+        .map(|entry| {
+            if entry.catch_type == 0 {
+                Some(Type::Object("java/lang/Throwable".to_string()))
+            } else {
+                cp_class_name(&class.constant_pool, entry.catch_type)
+                    .ok()
+                    .map(Type::get_object_type)
+            }
+        })
 }

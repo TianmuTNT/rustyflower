@@ -10,6 +10,10 @@ use std::collections::HashSet;
 pub enum StructuredStmt {
     Sequence(Vec<StructuredStmt>),
     Basic(Vec<Stmt>),
+    TryCatch {
+        try_body: Box<StructuredStmt>,
+        catches: Vec<CatchArm>,
+    },
     Switch {
         expr: StructuredExpr,
         arms: Vec<SwitchArm>,
@@ -34,6 +38,13 @@ pub struct SwitchArm {
     pub body: Box<StructuredStmt>,
 }
 
+#[derive(Debug, Clone)]
+pub struct CatchArm {
+    pub catch_type: String,
+    pub catch_var: String,
+    pub body: Box<StructuredStmt>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SwitchLabel {
     Int(i32),
@@ -42,6 +53,15 @@ pub enum SwitchLabel {
 }
 
 pub fn decompile_method(class: &LoadedClass, method: &LoadedMethod) -> Result<StructuredStmt> {
+    if method
+        .exception_table
+        .iter()
+        .any(|entry| entry.catch_type == 0)
+    {
+        return Err(DecompileError::Unsupported(
+            "catch-all/finally reconstruction is not implemented yet".to_string(),
+        ));
+    }
     let cfg = build_cfg(method)?;
     if cfg.blocks.is_empty() {
         return Ok(StructuredStmt::Sequence(Vec::new()));
@@ -54,6 +74,7 @@ pub fn decompile_method(class: &LoadedClass, method: &LoadedMethod) -> Result<St
         cfg: &cfg,
         semantics: &semantics,
         visited: HashSet::new(),
+        suppressed_try_starts: HashSet::new(),
     };
     Ok(StructuredStmt::Sequence(builder.build_range(
         0,
@@ -68,6 +89,7 @@ struct Builder<'a> {
     cfg: &'a ControlFlowGraph,
     semantics: &'a [BlockSemantics],
     visited: HashSet<usize>,
+    suppressed_try_starts: HashSet<u16>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -88,8 +110,18 @@ impl<'a> Builder<'a> {
         let mut pos = start_pos;
         while pos < end_pos {
             let block_id = self.cfg.order[pos];
+            let block_start = self.cfg.blocks[block_id].start_offset;
             if self.visited.contains(&block_id) {
                 pos += 1;
+                continue;
+            }
+            if !self.suppressed_try_starts.contains(&block_start)
+                && let Some((stmt, next_pos, consumed)) =
+                    self.try_build_try_catch(pos, end_pos, goto_handling)?
+            {
+                self.visited.extend(consumed);
+                statements.push(stmt);
+                pos = next_pos;
                 continue;
             }
             if let Some((stmt, next_pos, consumed)) =
@@ -154,6 +186,119 @@ impl<'a> Builder<'a> {
             ));
         }
         StructuredStmt::Basic(stmts)
+    }
+
+    fn try_build_try_catch(
+        &mut self,
+        pos: usize,
+        end_pos: usize,
+        goto_handling: GotoHandling,
+    ) -> Result<Option<(StructuredStmt, usize, Vec<usize>)>> {
+        let start_offset = self.cfg.blocks[self.cfg.order[pos]].start_offset;
+        let mut entries = self
+            .method
+            .exception_table
+            .iter()
+            .filter(|entry| entry.start_pc == start_offset && entry.catch_type != 0)
+            .cloned()
+            .collect::<Vec<_>>();
+        if entries.is_empty() {
+            return Ok(None);
+        }
+
+        let end_pc = entries[0].end_pc;
+        entries.retain(|entry| entry.end_pc == end_pc && entry.catch_type != 0);
+        if entries.is_empty() {
+            return Ok(None);
+        }
+
+        let try_end_pos = self.position_for_offset(end_pc)?;
+        if try_end_pos <= pos || try_end_pos > end_pos {
+            return Ok(None);
+        }
+        if (pos..try_end_pos).any(|region_pos| self.visited.contains(&self.cfg.order[region_pos])) {
+            return Ok(None);
+        }
+
+        let mut handlers = Vec::new();
+        for entry in entries {
+            let handler_pos = self.position_for_offset(entry.handler_pc)?;
+            if handler_pos < try_end_pos {
+                return Ok(None);
+            }
+            let catch_type =
+                crate::bytecode::cp_class_name(&self.class.constant_pool, entry.catch_type)
+                    .map(str::to_string)
+                    .map_err(|_| DecompileError::Unsupported("invalid catch type".to_string()))?;
+            handlers.push((handler_pos, catch_type));
+        }
+        handlers.sort_by_key(|(handler_pos, _)| *handler_pos);
+        handlers.dedup_by_key(|(handler_pos, _)| *handler_pos);
+
+        let merge_pos = self.find_try_catch_merge_pos(pos, try_end_pos, &handlers, end_pos);
+        let merge_offset = if merge_pos < self.cfg.order.len() {
+            Some(self.cfg.blocks[self.cfg.order[merge_pos]].start_offset)
+        } else {
+            None
+        };
+
+        self.suppressed_try_starts.insert(start_offset);
+        let try_body = wrap_sequence(self.build_range(
+            pos,
+            try_end_pos,
+            match merge_offset {
+                Some(offset) => GotoHandling::Suppress(offset),
+                None => goto_handling,
+            },
+        )?);
+        let try_body = strip_try_comments(try_body);
+
+        let mut catches = Vec::new();
+        let mut consumed = Vec::new();
+        for region_pos in pos..try_end_pos {
+            consumed.push(self.cfg.order[region_pos]);
+        }
+
+        for (index, (handler_pos, catch_type)) in handlers.iter().enumerate() {
+            let catch_end = handlers
+                .get(index + 1)
+                .map(|(next_pos, _)| *next_pos)
+                .unwrap_or(merge_pos)
+                .min(merge_pos);
+            let catch_body = wrap_sequence(self.build_range(
+                *handler_pos,
+                catch_end,
+                match merge_offset {
+                    Some(offset) => GotoHandling::Suppress(offset),
+                    None => goto_handling,
+                },
+            )?);
+            let catch_body = strip_try_comments(catch_body);
+            let (catch_var, catch_body) =
+                extract_catch_binding(self.method, catch_body, catch_type);
+            for region_pos in *handler_pos..catch_end {
+                consumed.push(self.cfg.order[region_pos]);
+            }
+            catches.push(CatchArm {
+                catch_type: catch_type.clone(),
+                catch_var,
+                body: Box::new(catch_body),
+            });
+        }
+        self.suppressed_try_starts.remove(&start_offset);
+
+        if catches.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some((
+            StructuredStmt::TryCatch {
+                try_body: Box::new(try_body),
+                catches,
+            },
+            merge_pos,
+            consumed,
+        )))
     }
 
     fn try_build_switch(
@@ -529,6 +674,40 @@ impl<'a> Builder<'a> {
 
         Ok(merge_candidates.into_iter().min().unwrap_or(end_pos))
     }
+
+    fn find_try_catch_merge_pos(
+        &self,
+        try_start_pos: usize,
+        try_end_pos: usize,
+        handlers: &[(usize, String)],
+        end_pos: usize,
+    ) -> usize {
+        let last_handler_pos = handlers
+            .iter()
+            .map(|(handler_pos, _)| *handler_pos)
+            .max()
+            .unwrap_or(try_end_pos);
+        let mut candidates = Vec::new();
+
+        for pos in try_start_pos..end_pos {
+            let block_id = self.cfg.order[pos];
+            let block = &self.cfg.blocks[block_id];
+            let successors = successor_positions(self.cfg, &self.semantics[block_id]);
+            for successor in successors {
+                if successor > last_handler_pos {
+                    candidates.push(successor);
+                }
+            }
+            if pos >= last_handler_pos
+                && block.successors.is_empty()
+                && block.exception_successors.is_empty()
+            {
+                candidates.push(pos + 1);
+            }
+        }
+
+        candidates.into_iter().min().unwrap_or(end_pos)
+    }
 }
 
 fn translate_blocks(
@@ -570,6 +749,117 @@ fn wrap_sequence(statements: Vec<StructuredStmt>) -> StructuredStmt {
             .unwrap_or(StructuredStmt::Empty),
         _ => StructuredStmt::Sequence(statements),
     }
+}
+
+fn strip_try_comments(stmt: StructuredStmt) -> StructuredStmt {
+    match stmt {
+        StructuredStmt::Sequence(statements) => {
+            let stripped = statements
+                .into_iter()
+                .map(strip_try_comments)
+                .filter(|statement| !matches!(statement, StructuredStmt::Empty))
+                .collect::<Vec<_>>();
+            wrap_sequence(stripped)
+        }
+        StructuredStmt::Basic(stmts) => {
+            let stmts = stmts
+                .into_iter()
+                .filter(|stmt| {
+                    !matches!(
+                        stmt,
+                        Stmt::Comment(message)
+                            if message == "rustyflower: try/catch reconstruction is not implemented yet"
+                    )
+                })
+                .collect::<Vec<_>>();
+            if stmts.is_empty() {
+                StructuredStmt::Empty
+            } else {
+                StructuredStmt::Basic(stmts)
+            }
+        }
+        StructuredStmt::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => StructuredStmt::If {
+            condition,
+            then_branch: Box::new(strip_try_comments(*then_branch)),
+            else_branch: else_branch.map(|branch| Box::new(strip_try_comments(*branch))),
+        },
+        StructuredStmt::While { condition, body } => StructuredStmt::While {
+            condition,
+            body: Box::new(strip_try_comments(*body)),
+        },
+        StructuredStmt::Switch { expr, arms } => StructuredStmt::Switch {
+            expr,
+            arms: arms
+                .into_iter()
+                .map(|arm| SwitchArm {
+                    labels: arm.labels,
+                    has_default: arm.has_default,
+                    body: Box::new(strip_try_comments(*arm.body)),
+                })
+                .collect(),
+        },
+        StructuredStmt::TryCatch { try_body, catches } => StructuredStmt::TryCatch {
+            try_body: Box::new(strip_try_comments(*try_body)),
+            catches: catches
+                .into_iter()
+                .map(|catch| CatchArm {
+                    catch_type: catch.catch_type,
+                    catch_var: catch.catch_var,
+                    body: Box::new(strip_try_comments(*catch.body)),
+                })
+                .collect(),
+        },
+        other => other,
+    }
+}
+
+fn extract_catch_binding(
+    method: &LoadedMethod,
+    stmt: StructuredStmt,
+    catch_type: &str,
+) -> (String, StructuredStmt) {
+    match stmt {
+        StructuredStmt::Basic(mut stmts) => {
+            if let Some(Stmt::Assign {
+                target: StructuredExpr::Var(slot),
+                value: StructuredExpr::CaughtException(_),
+            }) = stmts.first()
+            {
+                let name = method.slot_name(*slot);
+                stmts.remove(0);
+                let body = if stmts.is_empty() {
+                    StructuredStmt::Empty
+                } else {
+                    StructuredStmt::Basic(stmts)
+                };
+                return (name, body);
+            }
+            ("var_catch".to_string(), StructuredStmt::Basic(stmts))
+        }
+        StructuredStmt::Sequence(mut stmts) => {
+            if let Some(first) = stmts.first_mut() {
+                let (name, rewritten) = extract_catch_binding(method, first.clone(), catch_type);
+                *first = rewritten;
+                let rewritten = wrap_sequence(stmts);
+                return (name, rewritten);
+            }
+            (
+                fallback_catch_var(catch_type),
+                StructuredStmt::Sequence(Vec::new()),
+            )
+        }
+        other => (fallback_catch_var(catch_type), other),
+    }
+}
+
+fn fallback_catch_var(catch_type: &str) -> String {
+    let short = catch_type.rsplit('/').next().unwrap_or(catch_type);
+    let first = short.chars().next().unwrap_or('e').to_ascii_lowercase();
+    format!("{first}0")
 }
 
 fn successor_positions(cfg: &ControlFlowGraph, semantics: &BlockSemantics) -> Vec<usize> {
