@@ -114,6 +114,7 @@ pub enum Stmt {
         value: StructuredExpr,
     },
     Expr(StructuredExpr),
+    Break,
     Return(Option<StructuredExpr>),
     Throw(StructuredExpr),
     ConstructorCall {

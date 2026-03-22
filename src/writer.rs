@@ -262,6 +262,20 @@ fn write_structured_stmt(
                 write_stmt(out, statement, indent, ctx);
             }
         }
+        StructuredStmt::Switch { expr, arms } => {
+            let pad = "    ".repeat(indent);
+            let _ = writeln!(out, "{}switch ({}) {{", pad, render_expr(expr, ctx));
+            for arm in arms {
+                for label in &arm.labels {
+                    let _ = writeln!(out, "{}case {}:", "    ".repeat(indent + 1), label);
+                }
+                if arm.has_default {
+                    let _ = writeln!(out, "{}default:", "    ".repeat(indent + 1));
+                }
+                write_structured_stmt(out, &arm.body, indent + 2, ctx);
+            }
+            let _ = writeln!(out, "{}}}", pad);
+        }
         StructuredStmt::If {
             condition,
             then_branch,
@@ -338,6 +352,9 @@ fn write_stmt(out: &mut String, stmt: &Stmt, indent: usize, ctx: &mut MethodWrit
         }
         Stmt::Expr(expr) => {
             let _ = writeln!(out, "{}{};", pad, render_expr(expr, ctx));
+        }
+        Stmt::Break => {
+            let _ = writeln!(out, "{}break;", pad);
         }
         Stmt::Return(value) => {
             if let Some(value) = value {
