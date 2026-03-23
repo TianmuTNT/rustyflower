@@ -16,6 +16,11 @@ pub enum StructuredStmt {
         catches: Vec<CatchArm>,
         finally_body: Option<Box<StructuredStmt>>,
     },
+    TryWithResources {
+        resources: Vec<TryResource>,
+        body: Box<StructuredStmt>,
+        catches: Vec<CatchArm>,
+    },
     Synchronized {
         expr: StructuredExpr,
         body: Box<StructuredStmt>,
@@ -65,6 +70,13 @@ pub struct CatchArm {
     pub catch_type: String,
     pub catch_var: String,
     pub body: Box<StructuredStmt>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TryResource {
+    pub var_type: Type,
+    pub var_name: String,
+    pub initializer: StructuredExpr,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,6 +149,12 @@ struct Builder<'a> {
     semantics: &'a [BlockSemantics],
     visited: HashSet<usize>,
     suppressed_try_starts: HashSet<u16>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BranchResolution {
+    Offset(u16),
+    RangeEnd(usize),
 }
 
 fn build_expression_from_block(
@@ -718,6 +736,24 @@ impl<'a> Builder<'a> {
             .or_else(|| catch_all_handler.map(|(handler_pos, _)| handler_pos))
             .unwrap_or(merge_pos);
 
+        if catch_all_handler.is_none() && try_end_pos < first_handler_pos {
+            let normal_tail = wrap_sequence(self.build_range(
+                try_end_pos,
+                first_handler_pos,
+                merge_offset
+                    .map(|offset| goto_handling.with_suppressed(offset))
+                    .unwrap_or_else(|| goto_handling.clone()),
+            )?);
+            let normal_tail = strip_try_comments(normal_tail);
+            if !matches!(normal_tail, StructuredStmt::Empty)
+                && has_terminal_exit(&normal_tail)
+            {
+                let mut items = top_level_items(try_body);
+                items.extend(top_level_items(normal_tail));
+                try_body = wrap_sequence(items);
+            }
+        }
+
         let mut finally_body = None;
         if let Some((catch_all_pos, _handler_pc)) = catch_all_handler {
             let catch_all_start_offset = self.cfg.blocks[self.cfg.order[catch_all_pos]].start_offset;
@@ -1007,7 +1043,9 @@ impl<'a> Builder<'a> {
                 return Ok(None);
             }
 
-            let exit_offset = self.cfg.blocks[self.cfg.order[exit_pos]].start_offset;
+            let Some(exit_offset) = self.start_offset_at(exit_pos) else {
+                return Ok(None);
+            };
             let body_stmts = self.build_range(
                 body_start_pos,
                 condition_pos,
@@ -1070,7 +1108,9 @@ impl<'a> Builder<'a> {
         if !has_backedge {
             return Ok(None);
         }
-        let exit_offset = self.cfg.blocks[self.cfg.order[exit_pos]].start_offset;
+        let Some(exit_offset) = self.start_offset_at(exit_pos) else {
+            return Ok(None);
+        };
         let body_stmts = self.build_range(
             body_start_pos,
             exit_pos,
@@ -1129,7 +1169,9 @@ impl<'a> Builder<'a> {
                 continue;
             }
 
-            let exit_offset = self.cfg.blocks[self.cfg.order[exit_pos]].start_offset;
+            let Some(exit_offset) = self.start_offset_at(exit_pos) else {
+                continue;
+            };
             let body_stmts = self.build_range(
                 pos,
                 condition_pos,
@@ -1255,12 +1297,14 @@ impl<'a> Builder<'a> {
         };
 
         let body_start_offset = self.cfg.blocks[self.cfg.order[body_start_pos]].start_offset;
-        let exit_offset = self.cfg.blocks[self.cfg.order[exit_pos]].start_offset;
+        let Some(exit_offset) = self.start_offset_at(exit_pos) else {
+            return Ok(None);
+        };
         let mut visiting = HashSet::new();
         let Some(condition) = self.build_branch_expression(
             block_id,
-            body_start_offset,
-            exit_offset,
+            BranchResolution::Offset(body_start_offset),
+            BranchResolution::Offset(exit_offset),
             &mut visiting,
         ) else {
             return Ok(None);
@@ -1321,13 +1365,12 @@ impl<'a> Builder<'a> {
         if exit_pos <= body_start_pos || exit_pos > end_pos {
             return Ok(None);
         }
-        let exit_offset = self.cfg.blocks[self.cfg.order[exit_pos]].start_offset;
 
         let mut visiting = HashSet::new();
         let Some(condition) = self.build_branch_expression(
             block_id,
-            self.cfg.blocks[body_start_id].start_offset,
-            exit_offset,
+            BranchResolution::Offset(self.cfg.blocks[body_start_id].start_offset),
+            BranchResolution::RangeEnd(exit_pos),
             &mut visiting,
         ) else {
             return Ok(None);
@@ -1347,8 +1390,8 @@ impl<'a> Builder<'a> {
     fn build_branch_expression(
         &self,
         block_id: usize,
-        true_offset: u16,
-        false_offset: u16,
+        true_target: BranchResolution,
+        false_target: BranchResolution,
         visiting: &mut HashSet<usize>,
     ) -> Option<StructuredExpr> {
         if !visiting.insert(block_id) {
@@ -1364,12 +1407,16 @@ impl<'a> Builder<'a> {
                     jump_target,
                     fallthrough_target,
                 } => {
-                    let on_jump =
-                        self.resolve_branch_target(*jump_target, true_offset, false_offset, visiting)?;
+                    let on_jump = self.resolve_branch_target(
+                        *jump_target,
+                        true_target,
+                        false_target,
+                        visiting,
+                    )?;
                     let on_fall = self.resolve_branch_target(
                         *fallthrough_target,
-                        true_offset,
-                        false_offset,
+                        true_target,
+                        false_target,
                         visiting,
                     )?;
                     Some(combine_conditional_expression(
@@ -1380,7 +1427,7 @@ impl<'a> Builder<'a> {
                     ))
                 }
                 Terminator::Goto(target) => {
-                    self.resolve_branch_target(*target, true_offset, false_offset, visiting)
+                    self.resolve_branch_target(*target, true_target, false_target, visiting)
                 }
                 _ => None,
             }
@@ -1392,22 +1439,40 @@ impl<'a> Builder<'a> {
     fn resolve_branch_target(
         &self,
         target: u16,
-        true_offset: u16,
-        false_offset: u16,
+        true_target: BranchResolution,
+        false_target: BranchResolution,
         visiting: &mut HashSet<usize>,
     ) -> Option<StructuredExpr> {
-        if target == true_offset {
+        if self.branch_matches(target, true_target) {
             return Some(StructuredExpr::Literal(crate::expr::Literal::Boolean(
                 true,
             )));
         }
-        if target == false_offset {
+        if self.branch_matches(target, false_target) {
             return Some(StructuredExpr::Literal(crate::expr::Literal::Boolean(
                 false,
             )));
         }
         let target_block = self.cfg.block_by_offset(target)?;
-        self.build_branch_expression(target_block.id, true_offset, false_offset, visiting)
+        self.build_branch_expression(target_block.id, true_target, false_target, visiting)
+    }
+
+    fn branch_matches(&self, target: u16, resolution: BranchResolution) -> bool {
+        match resolution {
+            BranchResolution::Offset(offset) => target == offset,
+            BranchResolution::RangeEnd(end_pos) => self
+                .cfg
+                .block_by_offset(target)
+                .map(|block| position_for_block(self.cfg, block.id) >= end_pos)
+                .unwrap_or(false),
+        }
+    }
+
+    fn start_offset_at(&self, pos: usize) -> Option<u16> {
+        self.cfg
+            .order
+            .get(pos)
+            .map(|block_id| self.cfg.blocks[*block_id].start_offset)
     }
 
     fn try_build_if(
@@ -1784,6 +1849,22 @@ fn rewrite_synchronized_stmt(stmt: StructuredStmt) -> StructuredStmt {
                 .collect(),
             finally_body: finally_body.map(|body| Box::new(rewrite_synchronized_stmt(*body))),
         },
+        StructuredStmt::TryWithResources {
+            resources,
+            body,
+            catches,
+        } => StructuredStmt::TryWithResources {
+            resources,
+            body: Box::new(rewrite_synchronized_stmt(*body)),
+            catches: catches
+                .into_iter()
+                .map(|catch| CatchArm {
+                    catch_type: catch.catch_type,
+                    catch_var: catch.catch_var,
+                    body: Box::new(rewrite_synchronized_stmt(*catch.body)),
+                })
+                .collect(),
+        },
         StructuredStmt::Switch { expr, arms } => StructuredStmt::Switch {
             expr,
             arms: arms
@@ -1861,6 +1942,22 @@ fn rewrite_control_flow_stmt(stmt: StructuredStmt) -> StructuredStmt {
                 })
                 .collect(),
             finally_body: finally_body.map(|body| Box::new(rewrite_control_flow_stmt(*body))),
+        },
+        StructuredStmt::TryWithResources {
+            resources,
+            body,
+            catches,
+        } => StructuredStmt::TryWithResources {
+            resources,
+            body: Box::new(rewrite_control_flow_stmt(*body)),
+            catches: catches
+                .into_iter()
+                .map(|catch| CatchArm {
+                    catch_type: catch.catch_type,
+                    catch_var: catch.catch_var,
+                    body: Box::new(rewrite_control_flow_stmt(*catch.body)),
+                })
+                .collect(),
         },
         StructuredStmt::Switch { expr, arms } => StructuredStmt::Switch {
             expr,
@@ -2251,6 +2348,22 @@ fn strip_monitor_exit_expr(stmt: StructuredStmt, monitor_exit_expr: &StructuredE
                 .collect(),
             finally_body: finally_body
                 .map(|body| Box::new(strip_monitor_exit_expr(*body, monitor_exit_expr))),
+        },
+        StructuredStmt::TryWithResources {
+            resources,
+            body,
+            catches,
+        } => StructuredStmt::TryWithResources {
+            resources,
+            body: Box::new(strip_monitor_exit_expr(*body, monitor_exit_expr)),
+            catches: catches
+                .into_iter()
+                .map(|catch| CatchArm {
+                    catch_type: catch.catch_type,
+                    catch_var: catch.catch_var,
+                    body: Box::new(strip_monitor_exit_expr(*catch.body, monitor_exit_expr)),
+                })
+                .collect(),
         },
         StructuredStmt::Synchronized { expr, body } => StructuredStmt::Synchronized {
             expr,
@@ -3195,11 +3308,38 @@ fn strip_try_comments(stmt: StructuredStmt) -> StructuredStmt {
                 .collect(),
             finally_body: finally_body.map(|body| Box::new(strip_try_comments(*body))),
         },
+        StructuredStmt::TryWithResources {
+            resources,
+            body,
+            catches,
+        } => StructuredStmt::TryWithResources {
+            resources,
+            body: Box::new(strip_try_comments(*body)),
+            catches: catches
+                .into_iter()
+                .map(|catch| CatchArm {
+                    catch_type: catch.catch_type,
+                    catch_var: catch.catch_var,
+                    body: Box::new(strip_try_comments(*catch.body)),
+                })
+                .collect(),
+        },
         StructuredStmt::Synchronized { expr, body } => StructuredStmt::Synchronized {
             expr,
             body: Box::new(strip_try_comments(*body)),
         },
         other => other,
+    }
+}
+
+fn has_terminal_exit(stmt: &StructuredStmt) -> bool {
+    match stmt {
+        StructuredStmt::Basic(stmts) => matches!(
+            stmts.last(),
+            Some(Stmt::Return(_) | Stmt::Throw(_))
+        ),
+        StructuredStmt::Sequence(items) => items.last().is_some_and(has_terminal_exit),
+        _ => false,
     }
 }
 

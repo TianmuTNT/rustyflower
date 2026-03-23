@@ -1,7 +1,7 @@
 use crate::bytecode::{ResolvedConstant, resolve_field_ref, resolve_ldc, resolve_method_ref};
 use crate::expr::{BinaryOp, Literal, Stmt, StructuredExpr};
 use crate::loader::{LoadedClass, LoadedMethod, load_class};
-use crate::structure::{StructuredStmt, SwitchArm, SwitchLabel};
+use crate::structure::{CatchArm, StructuredStmt, SwitchArm, SwitchLabel, TryResource};
 use rust_asm::types::Type;
 use rust_asm::class_reader::ClassReader;
 use rust_asm::constants::ACC_ENUM;
@@ -91,18 +91,40 @@ fn lower_stmt(
             try_body,
             catches,
             finally_body,
-        } => StructuredStmt::Try {
-            try_body: Box::new(lower_stmt(class, method, *try_body, resolver)),
+        } => {
+            let lowered_try_body = lower_stmt(class, method, *try_body, resolver);
+            let lowered_catches = catches
+                .into_iter()
+                .map(|catch| CatchArm {
+                    catch_type: catch.catch_type,
+                    catch_var: catch.catch_var,
+                    body: Box::new(lower_stmt(class, method, *catch.body, resolver)),
+                })
+                .collect::<Vec<_>>();
+            let lowered_finally =
+                finally_body.map(|body| Box::new(lower_stmt(class, method, *body, resolver)));
+            lower_try_with_resources(method, lowered_try_body.clone(), lowered_catches.clone())
+                .unwrap_or(StructuredStmt::Try {
+                    try_body: Box::new(lowered_try_body),
+                    catches: lowered_catches,
+                    finally_body: lowered_finally,
+                })
+        }
+        StructuredStmt::TryWithResources {
+            resources,
+            body,
+            catches,
+        } => StructuredStmt::TryWithResources {
+            resources,
+            body: Box::new(lower_stmt(class, method, *body, resolver)),
             catches: catches
                 .into_iter()
-                .map(|catch| crate::structure::CatchArm {
+                .map(|catch| CatchArm {
                     catch_type: catch.catch_type,
                     catch_var: catch.catch_var,
                     body: Box::new(lower_stmt(class, method, *catch.body, resolver)),
                 })
                 .collect(),
-            finally_body: finally_body
-                .map(|body| Box::new(lower_stmt(class, method, *body, resolver))),
         },
         StructuredStmt::Synchronized { expr, body } => StructuredStmt::Synchronized {
             expr,
@@ -650,6 +672,239 @@ fn wrap_sequence(statements: Vec<StructuredStmt>) -> StructuredStmt {
         0 => StructuredStmt::Empty,
         1 => statements.into_iter().next().unwrap_or(StructuredStmt::Empty),
         _ => StructuredStmt::Sequence(statements),
+    }
+}
+
+fn lower_try_with_resources(
+    method: &LoadedMethod,
+    try_body: StructuredStmt,
+    catches: Vec<CatchArm>,
+) -> Option<StructuredStmt> {
+    let (prefix, first_resource, mut body) = match_single_try_resource(method, try_body)?;
+    let mut resources = vec![first_resource];
+    if prefix.is_empty() {
+        loop {
+            let next_body = match body {
+                StructuredStmt::TryWithResources {
+                    resources: inner_resources,
+                    body: inner_body,
+                    catches: inner_catches,
+                } if inner_catches.is_empty() => {
+                    resources.extend(inner_resources);
+                    *inner_body
+                }
+                other => {
+                    body = other;
+                    break;
+                }
+            };
+            body = next_body;
+        }
+    }
+    let try_stmt = StructuredStmt::TryWithResources {
+        resources,
+        body: Box::new(body),
+        catches,
+    };
+    if prefix.is_empty() {
+        Some(try_stmt)
+    } else {
+        Some(StructuredStmt::Sequence(vec![
+            StructuredStmt::Basic(prefix),
+            try_stmt,
+        ]))
+    }
+}
+
+fn match_single_try_resource(
+    method: &LoadedMethod,
+    try_body: StructuredStmt,
+) -> Option<(Vec<Stmt>, TryResource, StructuredStmt)> {
+    let mut items = flatten_sequence_stmt(try_body);
+    if items.len() != 4 {
+        return None;
+    }
+
+    let (prefix, resource) = extract_try_resource(method, items.remove(0))?;
+    let body_stmt = items.remove(0);
+    let close_stmt = items.remove(0);
+    let throw_stmt = items.remove(0);
+
+    let (primary_var, body) = extract_resource_body(body_stmt)?;
+    if !matches_resource_close(method, &close_stmt, resource.var_name.as_str(), primary_var.as_str()) {
+        return None;
+    }
+    if !matches_rethrow(method, &throw_stmt, primary_var.as_str()) {
+        return None;
+    }
+
+    Some((prefix, resource, body))
+}
+
+fn extract_try_resource(method: &LoadedMethod, stmt: StructuredStmt) -> Option<(Vec<Stmt>, TryResource)> {
+    let StructuredStmt::Basic(stmts) = stmt else {
+        return None;
+    };
+    let (last, prefix) = stmts.split_last()?;
+    let Stmt::Assign {
+        target: StructuredExpr::Var(slot),
+        value,
+    } = last
+    else {
+        return None;
+    };
+    Some((
+        prefix.to_vec(),
+        TryResource {
+            var_type: infer_expr_type_from_stmt(method, value)
+                .unwrap_or_else(|| Type::Object("java/lang/AutoCloseable".to_string())),
+            var_name: method.slot_name(*slot),
+            initializer: value.clone(),
+        },
+    ))
+}
+
+fn extract_resource_body(stmt: StructuredStmt) -> Option<(String, StructuredStmt)> {
+    let StructuredStmt::Try {
+        try_body,
+        catches,
+        finally_body: None,
+    } = stmt
+    else {
+        return None;
+    };
+    let [catch] = catches.as_slice() else {
+        return None;
+    };
+    if catch.catch_type != "java/lang/Throwable" || !is_structurally_empty(&catch.body) {
+        return None;
+    }
+    Some((catch.catch_var.clone(), *try_body))
+}
+
+fn matches_resource_close(
+    method: &LoadedMethod,
+    stmt: &StructuredStmt,
+    resource_var: &str,
+    primary_var: &str,
+) -> bool {
+    let StructuredStmt::Try {
+        try_body,
+        catches,
+        finally_body: None,
+    } = stmt
+    else {
+        return false;
+    };
+    let [catch] = catches.as_slice() else {
+        return false;
+    };
+    if catch.catch_type != "java/lang/Throwable" {
+        return false;
+    }
+    matches_close_call(method, try_body, resource_var)
+        && matches_add_suppressed(method, &catch.body, primary_var, catch.catch_var.as_str())
+}
+
+fn matches_close_call(method: &LoadedMethod, stmt: &StructuredStmt, resource_var: &str) -> bool {
+    matches_single_expr(stmt, |expr| {
+        matches!(
+            expr,
+            StructuredExpr::Call {
+                receiver: Some(receiver),
+                name,
+                descriptor,
+                args,
+                is_static: false,
+                ..
+            } if name == "close"
+                && descriptor == "()V"
+                && args.is_empty()
+                && matches!(&**receiver, StructuredExpr::Var(slot) if method.slot_name(*slot) == resource_var)
+        )
+    })
+}
+
+fn matches_add_suppressed(
+    method: &LoadedMethod,
+    stmt: &StructuredStmt,
+    primary_var: &str,
+    secondary_var: &str,
+) -> bool {
+    matches_single_expr(stmt, |expr| {
+        matches!(
+            expr,
+            StructuredExpr::Call {
+                receiver: Some(receiver),
+                name,
+                descriptor,
+                args,
+                is_static: false,
+                ..
+            } if name == "addSuppressed"
+                && descriptor == "(Ljava/lang/Throwable;)V"
+                && matches!(args.as_slice(), [StructuredExpr::Var(arg_slot)] if method.slot_name(*arg_slot) == secondary_var)
+                && matches!(&**receiver, StructuredExpr::Var(slot) if method.slot_name(*slot) == primary_var)
+        )
+    })
+}
+
+fn matches_rethrow(method: &LoadedMethod, stmt: &StructuredStmt, primary_var: &str) -> bool {
+    matches!(stmt,
+        StructuredStmt::Basic(stmts)
+            if matches!(stmts.as_slice(),
+                [Stmt::Throw(StructuredExpr::Var(slot))] if method.slot_name(*slot) == primary_var
+            )
+    )
+}
+
+fn matches_single_expr(
+    stmt: &StructuredStmt,
+    predicate: impl Fn(&StructuredExpr) -> bool,
+) -> bool {
+    match stmt {
+        StructuredStmt::Basic(stmts) => matches!(stmts.as_slice(), [Stmt::Expr(expr)] if predicate(expr)),
+        StructuredStmt::Sequence(items) if items.len() == 1 => matches_single_expr(&items[0], predicate),
+        _ => false,
+    }
+}
+
+fn is_structurally_empty(stmt: &StructuredStmt) -> bool {
+    match stmt {
+        StructuredStmt::Empty => true,
+        StructuredStmt::Basic(stmts) => stmts.is_empty(),
+        StructuredStmt::Sequence(items) => items.iter().all(is_structurally_empty),
+        _ => false,
+    }
+}
+
+fn infer_expr_type_from_stmt(method: &LoadedMethod, expr: &StructuredExpr) -> Option<Type> {
+    match expr {
+        StructuredExpr::Var(slot) => method.slot_type(*slot),
+        StructuredExpr::Field { descriptor, .. } => Some(descriptor.clone()),
+        StructuredExpr::Call { descriptor, .. } => crate::types::parse_method_descriptor(descriptor)
+            .ok()
+            .map(|parsed| parsed.return_type),
+        StructuredExpr::New { class_name, .. } => Some(Type::Object(class_name.clone())),
+        StructuredExpr::NewArray { element_type, .. } => {
+            Some(Type::Array(Box::new(element_type.clone())))
+        }
+        StructuredExpr::Cast { ty, .. } => Some(ty.clone()),
+        StructuredExpr::StringConcat { .. } => Some(Type::Object("java/lang/String".to_string())),
+        StructuredExpr::Literal(Literal::String(_)) => {
+            Some(Type::Object("java/lang/String".to_string()))
+        }
+        StructuredExpr::Literal(Literal::Class(_)) => {
+            Some(Type::Object("java/lang/Class".to_string()))
+        }
+        StructuredExpr::Literal(Literal::Boolean(_)) => Some(Type::Boolean),
+        StructuredExpr::Literal(Literal::Char(_)) => Some(Type::Char),
+        StructuredExpr::Literal(Literal::Int(_)) => Some(Type::Int),
+        StructuredExpr::Literal(Literal::Float(_)) => Some(Type::Float),
+        StructuredExpr::Literal(Literal::Long(_)) => Some(Type::Long),
+        StructuredExpr::Literal(Literal::Double(_)) => Some(Type::Double),
+        StructuredExpr::ArrayLength(_) => Some(Type::Int),
+        _ => None,
     }
 }
 

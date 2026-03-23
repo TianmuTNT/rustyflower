@@ -282,6 +282,13 @@ impl<'a> BlockTranslator<'a> {
         }
         Ok(())
     }
+
+    fn value_size(value: &StackValue) -> usize {
+        match value.ty.as_ref() {
+            Some(Type::Long) | Some(Type::Double) => 2,
+            _ => 1,
+        }
+    }
 }
 
 pub fn translate_block(
@@ -313,10 +320,50 @@ pub fn translate_block(
         }
         translate_instruction(&mut translator, insn)?;
     }
+    if let Some(terminator) = inline_fallthrough_terminator(method, &mut translator, fallthrough)? {
+        return Ok(BlockSemantics {
+            stmts: translator.statements,
+            terminator,
+        });
+    }
     Ok(BlockSemantics {
         stmts: translator.statements,
         terminator: Terminator::Fallthrough(fallthrough),
     })
+}
+
+fn inline_fallthrough_terminator(
+    method: &LoadedMethod,
+    translator: &mut BlockTranslator<'_>,
+    fallthrough: Option<u16>,
+) -> Result<Option<Terminator>> {
+    let Some(target_offset) = fallthrough else {
+        return Ok(None);
+    };
+    let Some(next_index) = method
+        .instruction_offsets
+        .iter()
+        .position(|offset| *offset == target_offset)
+    else {
+        return Ok(None);
+    };
+    let Some(next_insn) = method.instructions.get(next_index) else {
+        return Ok(None);
+    };
+    let terminator = match next_insn {
+        Insn::Simple(node)
+            if is_return(node.opcode)
+                && node.opcode != opcodes::RETURN
+                && !translator.stack.is_empty() =>
+        {
+            Some(Terminator::Return(Some(translator.pop_expr()?.0)))
+        }
+        Insn::Simple(node) if node.opcode == opcodes::ATHROW && !translator.stack.is_empty() => {
+            Some(Terminator::Throw(translator.pop_expr()?.0))
+        }
+        _ => None,
+    };
+    Ok(terminator)
 }
 
 fn translate_terminator(
@@ -505,6 +552,33 @@ fn translate_simple_instruction(translator: &mut BlockTranslator<'_>, opcode: u8
             translator.stack.push(duplicate);
             translator.stack.push(value2);
             translator.stack.push(original);
+            Ok(())
+        }
+        opcodes::DUP_X2 => {
+            let value1 = translator.pop()?;
+            if BlockTranslator::value_size(&value1) != 1 {
+                return Err(DecompileError::Unsupported(
+                    "dup_x2 with category-2 top value is not implemented".to_string(),
+                ));
+            }
+            let value2 = translator.pop()?;
+            let (original, duplicate) = translator.ensure_duplicable(value1);
+            if BlockTranslator::value_size(&value2) == 2 {
+                translator.stack.push(duplicate);
+                translator.stack.push(value2);
+                translator.stack.push(original);
+            } else {
+                let value3 = translator.pop()?;
+                if BlockTranslator::value_size(&value3) != 1 {
+                    return Err(DecompileError::Unsupported(
+                        "dup_x2 with mixed-width stack values is not implemented".to_string(),
+                    ));
+                }
+                translator.stack.push(duplicate);
+                translator.stack.push(value3);
+                translator.stack.push(value2);
+                translator.stack.push(original);
+            }
             Ok(())
         }
         opcodes::SWAP => {

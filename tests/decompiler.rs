@@ -171,7 +171,7 @@ fn decompiles_simple_while_loop() {
 
     let output = rustyflower::decompile_bytes(&bytes).expect("decompilation should succeed");
     assert!(output.contains("while ("));
-    assert!(output.contains("arg0 = (arg0 - 1);"));
+    assert!(output.contains("arg0 = (arg0 - 1);") || output.contains("arg0 -= 1;"));
     assert!(output.contains("return arg0;"));
 }
 
@@ -671,7 +671,7 @@ fn decompiles_vineflower_synchronized_mapping_fixture() {
     let output = rustyflower::decompile_path(&class_path).expect("fixture should decompile");
     assert!(output.contains("public class TestSynchronizedMapping"));
     assert!(output.contains("synchronized (this)"));
-    assert!(output.contains("arg0 = (arg0 + 1);"));
+    assert!(output.contains("arg0 = (arg0 + 1);") || output.contains("arg0 += 1;"));
     assert_no_unresolved_artifacts(&output);
 }
 
@@ -859,7 +859,10 @@ fn decompiles_vineflower_class_lambda_fixture() {
 fn decompiles_vineflower_for_continue_fixture() {
     let class_path = compile_vineflower_source("testData/src/java8/pkg/TestForContinue.java");
     let output = rustyflower::decompile_path(&class_path).expect("fixture should decompile");
-    assert!(output.contains("for (int var2 = 0; (var2 < arg0); var2 = (var2 + 1))"));
+    assert!(
+        output.contains("for (int var2 = 0; (var2 < arg0); var2 = (var2 + 1))")
+            || output.contains("for (int var2 = 0; (var2 < arg0); var2 += 1)")
+    );
     assert!(
         output.contains("if ((var2 == 4))") || output.contains("if ((var2 != 4))"),
         "expected either explicit continue or inverted-condition form:\n{output}"
@@ -923,4 +926,53 @@ fn decompiles_vineflower_while_condition_fixture() {
     assert!(output.matches("while (").count() >= 2);
     assert!(!output.contains("unsupported goto"));
     assert_recompiles_output("TestWhileCondition", &output);
+}
+
+#[test]
+fn decompiles_previous_panic_fixtures_without_fallback_comment() {
+    for fixture in [
+        "testData/src/java8/pkg/TestAmbiguousArraylen.java",
+        "testData/src/java8/pkg/TestAssignmentInDoWhile.java",
+        "testData/src/java8/pkg/TestAssignmentTernaryConstantSimplification.java",
+        "testData/src/java8/pkg/TestGenericCastCall.java",
+    ] {
+        let class_path = compile_vineflower_source(fixture);
+        let output = rustyflower::decompile_path(&class_path).expect("fixture should decompile");
+        assert!(
+            !output.contains("rustyflower: method body decompilation is being implemented incrementally."),
+            "fixture regressed to incremental fallback: {fixture}\n{output}"
+        );
+    }
+}
+
+#[test]
+fn decompiles_vineflower_generics_fixture_with_array_casts_and_static_init() {
+    let class_path = compile_vineflower_source("testData/src/java8/pkg/TestGenerics.java");
+    let output = rustyflower::decompile_path(&class_path).expect("fixture should decompile");
+    assert!(output.contains("this.aArray = ((A[]) new java.lang.Object[10]);"));
+    assert!(output.contains("this.aArray = ((A[]) new java.lang.Object[20]);"));
+    assert!(output.contains(
+        "pkg.TestGenerics.field = ((java.util.Map<java.lang.String, java.lang.Boolean>) pkg.TestGenerics.Maps.newHashMap());"
+    ));
+    assert!(!output.contains("rustyflower: method body decompilation is being implemented incrementally."));
+}
+
+#[test]
+fn decompiles_vineflower_try_with_resources_fixture_resugars_primary_patterns() {
+    let class_path = compile_vineflower_source("testData/src/java8/pkg/TestTryWithResources.java");
+    let output = rustyflower::decompile_path(&class_path).expect("fixture should decompile");
+    assert!(output.contains("try (java.nio.file.FileSystem var0 ="));
+    assert!(output.contains("try (java.io.InputStream var1 ="));
+    assert!(!output.contains("catch (java.lang.Throwable var2) {\n        }\n        try {\n            var0.close();"));
+}
+
+#[test]
+fn decompiles_vineflower_compound_assignment_fixture_resugars_basic_ops() {
+    let class_path = compile_vineflower_source("testData/src/java8/pkg/TestCompoundAssignment.java");
+    let output = rustyflower::decompile_path(&class_path).expect("fixture should decompile");
+    assert!(output.contains("arg0 += arg1;"));
+    assert!(output.contains("arg0 += (arg1 + arg2);"));
+    assert!(output.contains("arg0 += ((arg1 + arg2) * arg3);"));
+    assert!(output.contains("arg2[arg3] = arg1;"));
+    assert!(output.contains("arg0 += arg1;"));
 }

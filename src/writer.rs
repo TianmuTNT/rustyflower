@@ -2,7 +2,7 @@ use crate::expr::{BinaryOp, Literal, Stmt, StringConcatPart, StructuredExpr, Una
 use crate::loader::{LoadedClass, LoadedConstant, LoadedField, LoadedMethod};
 use crate::lowering::{ClassPathResolver, lower_switches};
 use crate::structure::{
-    StructuredStmt, SwitchLabel, decompile_expression_fallback, decompile_method,
+    StructuredStmt, SwitchLabel, TryResource, decompile_expression_fallback, decompile_method,
     rewrite_control_flow,
 };
 use crate::types::{
@@ -269,49 +269,50 @@ fn write_method(
     indent: usize,
 ) {
     let pad = "    ".repeat(indent);
-    if method.name == "<clinit>" {
-        let _ = writeln!(out, "{pad}static {{");
-        write_unsupported_body(out, &method.parsed_descriptor.return_type, indent + 1, None);
-        let _ = writeln!(out, "{pad}}}");
-        return;
-    }
-
-    let mut header = String::new();
-    let _ = write!(header, "{pad}{}", member_modifiers(method.access_flags));
-    if let Some(signature) = &method.parsed_signature {
-        let rendered = render_type_parameters(&signature.type_parameters);
-        if !rendered.is_empty() {
-            let _ = write!(header, "{rendered} ");
-        }
-    }
-    if method.name == "<init>" {
-        let _ = write!(header, "{}", class_source_name(class));
+    let header = if method.name == "<clinit>" {
+        format!("{pad}static")
     } else {
-        let return_type = method
-            .parsed_signature
-            .as_ref()
-            .map(|signature| format_signature_type(&signature.return_type))
-            .unwrap_or_else(|| render_type_for_site(&method.parsed_descriptor.return_type, class, resolver, Some(method)));
-        let _ = write!(
-            header,
-            "{} {}",
-            return_type,
-            method_source_name(method)
-        );
-    }
-    let params = render_method_parameters(class, method, resolver);
-    let _ = write!(header, "({params})");
-    if !method.exceptions.is_empty() {
-        let rendered = method
-            .exceptions
-            .iter()
-            .map(|name| format_internal_name(name))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let _ = write!(header, " throws {rendered}");
-    }
-    if !method.has_code
-        || method.access_flags & (constants::ACC_ABSTRACT | constants::ACC_NATIVE) != 0
+        let mut header = String::new();
+        let _ = write!(header, "{pad}{}", member_modifiers(method.access_flags));
+        if let Some(signature) = &method.parsed_signature {
+            let rendered = render_type_parameters(&signature.type_parameters);
+            if !rendered.is_empty() {
+                let _ = write!(header, "{rendered} ");
+            }
+        }
+        if method.name == "<init>" {
+            let _ = write!(header, "{}", class_source_name(class));
+        } else {
+            let return_type = method
+                .parsed_signature
+                .as_ref()
+                .map(|signature| format_signature_type(&signature.return_type))
+                .unwrap_or_else(|| {
+                    render_type_for_site(
+                        &method.parsed_descriptor.return_type,
+                        class,
+                        resolver,
+                        Some(method),
+                    )
+                });
+            let _ = write!(header, "{} {}", return_type, method_source_name(method));
+        }
+        let params = render_method_parameters(class, method, resolver);
+        let _ = write!(header, "({params})");
+        if !method.exceptions.is_empty() {
+            let rendered = method
+                .exceptions
+                .iter()
+                .map(|name| format_internal_name(name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = write!(header, " throws {rendered}");
+        }
+        header
+    };
+    if method.name != "<clinit>"
+        && (!method.has_code
+            || method.access_flags & (constants::ACC_ABSTRACT | constants::ACC_NATIVE) != 0)
     {
         let _ = writeln!(out, "{header};");
         return;
@@ -456,6 +457,19 @@ fn contains_unresolved_artifacts(stmt: &StructuredStmt) -> bool {
                 || finally_body
                     .as_ref()
                     .is_some_and(|body| contains_unresolved_artifacts(body))
+        }
+        StructuredStmt::TryWithResources {
+            resources,
+            body,
+            catches,
+        } => {
+            resources
+                .iter()
+                .any(|resource| expr_has_unresolved_artifacts(&resource.initializer))
+                || contains_unresolved_artifacts(body)
+                || catches
+                    .iter()
+                    .any(|catch| contains_unresolved_artifacts(&catch.body))
         }
         StructuredStmt::Synchronized { expr, body } => {
             expr_has_unresolved_artifacts(expr) || contains_unresolved_artifacts(body)
@@ -780,6 +794,32 @@ fn write_structured_stmt(
                 let _ = writeln!(out, "{}}}", pad);
             }
         }
+        StructuredStmt::TryWithResources {
+            resources,
+            body,
+            catches,
+        } => {
+            let pad = "    ".repeat(indent);
+            let rendered_resources = resources
+                .iter()
+                .map(|resource| render_try_resource(resource, ctx))
+                .collect::<Vec<_>>()
+                .join("; ");
+            let _ = writeln!(out, "{}try ({}) {{", pad, rendered_resources);
+            write_structured_stmt(out, body, indent + 1, ctx);
+            let _ = writeln!(out, "{}}}", pad);
+            for catch in catches {
+                let _ = writeln!(
+                    out,
+                    "{}catch ({} {}) {{",
+                    pad,
+                    format_internal_name(&catch.catch_type),
+                    catch.catch_var
+                );
+                write_structured_stmt(out, &catch.body, indent + 1, ctx);
+                let _ = writeln!(out, "{}}}", pad);
+            }
+        }
         StructuredStmt::Synchronized { expr, body } => {
             let pad = "    ".repeat(indent);
             let _ = writeln!(out, "{}synchronized ({}) {{", pad, render_expr(expr, ctx));
@@ -951,10 +991,9 @@ fn write_stmt(out: &mut String, stmt: &Stmt, indent: usize, ctx: &mut MethodWrit
             }
             let _ = writeln!(
                 out,
-                "{}{} = {};",
+                "{}{};",
                 pad,
-                render_expr(target, ctx),
-                render_expr(value, ctx)
+                render_assignment_expr(target, value, ctx)
             );
             if let StructuredExpr::Var(slot) = target
                 && let Some(ty) = infer_expr_type(value, ctx)
@@ -1072,9 +1111,7 @@ fn render_for_init(init: &[Stmt], ctx: &mut MethodWriteContext<'_>) -> String {
 
 fn render_for_update(stmt: &Stmt, ctx: &MethodWriteContext<'_>) -> String {
     match stmt {
-        Stmt::Assign { target, value } => {
-            format!("{} = {}", render_expr(target, ctx), render_expr(value, ctx))
-        }
+        Stmt::Assign { target, value } => render_assignment_expr(target, value, ctx),
         Stmt::Expr(expr) => render_expr(expr, ctx),
         Stmt::TempAssign { id, value, .. } => {
             format!("tmp{} = {}", id, render_expr(value, ctx))
@@ -1095,6 +1132,180 @@ fn render_for_update(stmt: &Stmt, ctx: &MethodWriteContext<'_>) -> String {
         ),
         Stmt::MonitorEnter(expr) => format!("/* monitorenter {} */", render_expr(expr, ctx)),
         Stmt::MonitorExit(expr) => format!("/* monitorexit {} */", render_expr(expr, ctx)),
+    }
+}
+
+fn render_assignment_expr(
+    target: &StructuredExpr,
+    value: &StructuredExpr,
+    ctx: &MethodWriteContext<'_>,
+) -> String {
+    if let Some((op, rhs)) = compound_assignment_parts(target, value) {
+        return format!(
+            "{} {}= {}",
+            render_expr(target, ctx),
+            render_compound_operator(op),
+            render_expr(rhs, ctx)
+        );
+    }
+    format!(
+        "{} = {}",
+        render_expr(target, ctx),
+        render_value_for_target(target, value, ctx)
+    )
+}
+
+fn render_try_resource(resource: &TryResource, ctx: &MethodWriteContext<'_>) -> String {
+    format!(
+        "{} {} = {}",
+        render_type_in_context(&resource.var_type, ctx),
+        resource.var_name,
+        render_expr(&resource.initializer, ctx)
+    )
+}
+
+fn render_value_for_target(
+    target: &StructuredExpr,
+    value: &StructuredExpr,
+    ctx: &MethodWriteContext<'_>,
+) -> String {
+    if let Some(signature) = signature_for_target_expr(target, ctx) {
+        return render_expr_as_signature(value, &signature, ctx);
+    }
+    if let Some(ty) = infer_target_type(target, ctx) {
+        return render_expr_as_type(value, &ty, ctx);
+    }
+    render_expr(value, ctx)
+}
+
+fn render_expr_as_signature(
+    expr: &StructuredExpr,
+    signature: &SignatureType,
+    ctx: &MethodWriteContext<'_>,
+) -> String {
+    let rendered = render_expr(expr, ctx);
+    if signature_needs_explicit_cast(signature) && !matches!(expr, StructuredExpr::Cast { .. }) {
+        return format!("(({}) {})", format_signature_type(signature), rendered);
+    }
+    rendered
+}
+
+fn signature_needs_explicit_cast(signature: &SignatureType) -> bool {
+    match signature {
+        SignatureType::Base(_) => false,
+        SignatureType::TypeVariable(_) => true,
+        SignatureType::Array(element) => signature_needs_explicit_cast(element),
+        SignatureType::Class(class) => {
+            !class.simple_class.type_arguments.is_empty()
+                || class
+                    .suffixes
+                    .iter()
+                    .any(|suffix| !suffix.type_arguments.is_empty())
+        }
+    }
+}
+
+fn signature_for_target_expr(
+    target: &StructuredExpr,
+    ctx: &MethodWriteContext<'_>,
+) -> Option<SignatureType> {
+    match target {
+        StructuredExpr::Field { owner, name, .. } => lookup_field(owner, name, ctx)
+            .and_then(|field| field.parsed_signature.clone()),
+        _ => None,
+    }
+}
+
+fn lookup_field(
+    owner: &str,
+    name: &str,
+    ctx: &MethodWriteContext<'_>,
+) -> Option<LoadedField> {
+    if owner == ctx.class.internal_name {
+        return ctx.class.fields.iter().find(|field| field.name == name).cloned();
+    }
+    ctx.resolver
+        .and_then(|resolver| resolver.load_class(owner))
+        .and_then(|class| class.fields.into_iter().find(|field| field.name == name))
+}
+
+fn infer_target_type(target: &StructuredExpr, ctx: &MethodWriteContext<'_>) -> Option<Type> {
+    match target {
+        StructuredExpr::Var(slot) => ctx
+            .slot_types
+            .get(slot)
+            .cloned()
+            .or_else(|| ctx.method.slot_type(*slot)),
+        StructuredExpr::Field { descriptor, .. } => Some(descriptor.clone()),
+        StructuredExpr::ArrayAccess { array, .. } => infer_expr_type(array, ctx).and_then(|ty| match ty {
+            Type::Array(element) => Some(*element),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+fn compound_assignment_parts<'a>(
+    target: &StructuredExpr,
+    value: &'a StructuredExpr,
+) -> Option<(BinaryOp, &'a StructuredExpr)> {
+    let StructuredExpr::Binary { op, left, right } = value else {
+        return None;
+    };
+    if !is_compound_assignment_op(*op) {
+        return None;
+    }
+    if expr_matches_target(target, left) {
+        return Some((*op, right));
+    }
+    if is_commutative_assignment_op(*op) && expr_matches_target(target, right) {
+        return Some((*op, left));
+    }
+    None
+}
+
+fn expr_matches_target(target: &StructuredExpr, candidate: &StructuredExpr) -> bool {
+    target == candidate
+}
+
+fn is_commutative_assignment_op(op: BinaryOp) -> bool {
+    matches!(
+        op,
+        BinaryOp::Add | BinaryOp::Mul | BinaryOp::And | BinaryOp::Or | BinaryOp::Xor
+    )
+}
+
+fn is_compound_assignment_op(op: BinaryOp) -> bool {
+    matches!(
+        op,
+        BinaryOp::Add
+            | BinaryOp::Sub
+            | BinaryOp::Mul
+            | BinaryOp::Div
+            | BinaryOp::Rem
+            | BinaryOp::Shl
+            | BinaryOp::Shr
+            | BinaryOp::Ushr
+            | BinaryOp::And
+            | BinaryOp::Or
+            | BinaryOp::Xor
+    )
+}
+
+fn render_compound_operator(op: BinaryOp) -> &'static str {
+    match op {
+        BinaryOp::Add => "+",
+        BinaryOp::Sub => "-",
+        BinaryOp::Mul => "*",
+        BinaryOp::Div => "/",
+        BinaryOp::Rem => "%",
+        BinaryOp::Shl => "<<",
+        BinaryOp::Shr => ">>",
+        BinaryOp::Ushr => ">>>",
+        BinaryOp::And => "&",
+        BinaryOp::Or => "|",
+        BinaryOp::Xor => "^",
+        _ => return "=",
     }
 }
 
@@ -1515,6 +1726,19 @@ fn structured_stmt_contains_lambda(stmt: &StructuredStmt) -> bool {
                 || finally_body
                     .as_ref()
                     .is_some_and(|body| structured_stmt_contains_lambda(body))
+        }
+        StructuredStmt::TryWithResources {
+            resources,
+            body,
+            catches,
+        } => {
+            resources
+                .iter()
+                .any(|resource| expr_contains_lambda(&resource.initializer))
+                || structured_stmt_contains_lambda(body)
+                || catches
+                    .iter()
+                    .any(|catch| structured_stmt_contains_lambda(&catch.body))
         }
         StructuredStmt::Synchronized { expr, body } => {
             expr_contains_lambda(expr) || structured_stmt_contains_lambda(body)
