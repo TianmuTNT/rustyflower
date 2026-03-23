@@ -1,7 +1,10 @@
 use crate::expr::{BinaryOp, Literal, Stmt, StringConcatPart, StructuredExpr, UnaryOp};
 use crate::loader::{LoadedClass, LoadedConstant, LoadedField, LoadedMethod};
 use crate::lowering::{ClassPathResolver, lower_switches};
-use crate::structure::{StructuredStmt, SwitchLabel, decompile_expression_fallback, decompile_method};
+use crate::structure::{
+    StructuredStmt, SwitchLabel, decompile_expression_fallback, decompile_method,
+    rewrite_control_flow,
+};
 use crate::types::{
     default_value, format_internal_name, format_signature_type, format_type,
     parse_method_descriptor,
@@ -104,7 +107,7 @@ fn write_class_declaration(
     let visible_methods = class
         .methods
         .iter()
-        .filter(|method| !is_hidden_method(method))
+        .filter(|method| !is_hidden_method(class, method))
         .collect::<Vec<_>>();
     let nested_classes = member_nested_classes(class, resolver);
     if !visible_fields.is_empty() && (!visible_methods.is_empty() || !nested_classes.is_empty()) {
@@ -317,7 +320,7 @@ fn write_method(
     let _ = writeln!(out, "{header} {{");
     match decompile_method(class, method) {
         Ok(body) => {
-            let body = lower_switches(class, method, body, resolver);
+            let body = rewrite_control_flow(lower_switches(class, method, body, resolver));
             if contains_legacy_subroutine(method) && contains_unresolved_artifacts(&body) {
                 write_unsupported_body(out, &method.parsed_descriptor.return_type, indent + 1, None);
                 let _ = writeln!(out, "{pad}}}");
@@ -337,6 +340,7 @@ fn write_method(
         }
         Err(_error) => {
             if let Ok(Some(body)) = decompile_expression_fallback(class, method) {
+                let body = rewrite_control_flow(body);
                 let mut ctx = MethodWriteContext::new(class, method, resolver);
                 write_structured_stmt(out, &body, indent + 1, &mut ctx);
             } else {
@@ -418,10 +422,12 @@ fn synthetic_constructor_parameter_count(class: &LoadedClass, method: &LoadedMet
 }
 
 fn is_hidden_field(field: &LoadedField) -> bool {
-    field.name.starts_with("this$") || field.name.starts_with("val$")
+    field.name.starts_with("this$")
+        || field.name.starts_with("val$")
 }
 
-fn is_hidden_method(method: &LoadedMethod) -> bool {
+fn is_hidden_method(class: &LoadedClass, method: &LoadedMethod) -> bool {
+    let _ = class;
     method.name.starts_with("lambda$")
 }
 
@@ -474,6 +480,20 @@ fn contains_unresolved_artifacts(stmt: &StructuredStmt) -> bool {
         StructuredStmt::While { condition, body } => {
             expr_has_unresolved_artifacts(condition) || contains_unresolved_artifacts(body)
         }
+        StructuredStmt::DoWhile { condition, body } => {
+            expr_has_unresolved_artifacts(condition) || contains_unresolved_artifacts(body)
+        }
+        StructuredStmt::For {
+            init,
+            condition,
+            update,
+            body,
+        } => {
+            init.iter().any(stmt_has_unresolved_artifacts)
+                || expr_has_unresolved_artifacts(condition)
+                || update.iter().any(stmt_has_unresolved_artifacts)
+                || contains_unresolved_artifacts(body)
+        }
         StructuredStmt::ForEach {
             iterable, body, ..
         } => expr_has_unresolved_artifacts(iterable) || contains_unresolved_artifacts(body),
@@ -493,7 +513,7 @@ fn stmt_has_unresolved_artifacts(stmt: &Stmt) -> bool {
                 || expr_has_unresolved_artifacts(expr)
         }
         Stmt::Return(Some(expr)) => expr_has_unresolved_artifacts(expr),
-        Stmt::Return(None) | Stmt::Break => false,
+        Stmt::Return(None) | Stmt::Break | Stmt::Continue => false,
         Stmt::ConstructorCall { args, .. } => args.iter().any(expr_has_unresolved_artifacts),
         Stmt::Comment(_) => true,
     }
@@ -576,6 +596,7 @@ struct MethodWriteContext<'a> {
     declared_slots: HashSet<u16>,
     declared_temps: HashSet<u32>,
     temp_types: HashMap<u32, Type>,
+    slot_types: HashMap<u16, Type>,
     slot_overrides: HashMap<u16, String>,
     this_override: Option<String>,
 }
@@ -591,11 +612,17 @@ impl<'a> MethodWriteContext<'a> {
             .iter()
             .map(|parameter| parameter.slot)
             .collect::<HashSet<_>>();
+        let slot_types = method
+            .parameters
+            .iter()
+            .map(|parameter| (parameter.slot, parameter.descriptor.clone()))
+            .collect::<HashMap<_, _>>();
         Self::with_overrides(
             class,
             method,
             resolver,
             declared_slots,
+            slot_types,
             HashMap::new(),
             None,
         )
@@ -606,6 +633,7 @@ impl<'a> MethodWriteContext<'a> {
         method: &'a LoadedMethod,
         resolver: Option<&'a ClassPathResolver>,
         mut declared_slots: HashSet<u16>,
+        slot_types: HashMap<u16, Type>,
         slot_overrides: HashMap<u16, String>,
         this_override: Option<String>,
     ) -> Self {
@@ -617,6 +645,7 @@ impl<'a> MethodWriteContext<'a> {
             declared_slots,
             declared_temps: HashSet::new(),
             temp_types: HashMap::new(),
+            slot_types,
             slot_overrides,
             this_override,
         }
@@ -796,6 +825,36 @@ fn write_structured_stmt(
             write_structured_stmt(out, body, indent + 1, ctx);
             let _ = writeln!(out, "{}}}", pad);
         }
+        StructuredStmt::DoWhile { condition, body } => {
+            let pad = "    ".repeat(indent);
+            let _ = writeln!(out, "{}do {{", pad);
+            write_structured_stmt(out, body, indent + 1, ctx);
+            let _ = writeln!(out, "{}}} while ({});", pad, render_expr(condition, ctx));
+        }
+        StructuredStmt::For {
+            init,
+            condition,
+            update,
+            body,
+        } => {
+            let pad = "    ".repeat(indent);
+            let init = render_for_init(init, ctx);
+            let update = update
+                .iter()
+                .map(|stmt| render_for_update(stmt, ctx))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = writeln!(
+                out,
+                "{}for ({}; {}; {}) {{",
+                pad,
+                init,
+                render_expr(condition, ctx),
+                update
+            );
+            write_structured_stmt(out, body, indent + 1, ctx);
+            let _ = writeln!(out, "{}}}", pad);
+        }
         StructuredStmt::ForEach {
             var_type,
             var_name,
@@ -878,13 +937,14 @@ fn write_stmt(out: &mut String, stmt: &Stmt, indent: usize, ctx: &mut MethodWrit
                         .slot_type(*slot)
                         .or_else(|| infer_expr_type(value, ctx))
                         .unwrap_or(Type::Object("java/lang/Object".to_string()));
+                    ctx.slot_types.insert(*slot, ty.clone());
                     let _ = writeln!(
                         out,
                         "{}{} {} = {};",
                         pad,
                         render_type_in_context(&ty, ctx),
                         ctx.method.slot_name(*slot),
-                        render_expr(value, ctx)
+                        render_expr_as_type(value, &ty, ctx)
                     );
                     return;
                 }
@@ -896,6 +956,11 @@ fn write_stmt(out: &mut String, stmt: &Stmt, indent: usize, ctx: &mut MethodWrit
                 render_expr(target, ctx),
                 render_expr(value, ctx)
             );
+            if let StructuredExpr::Var(slot) = target
+                && let Some(ty) = infer_expr_type(value, ctx)
+            {
+                ctx.slot_types.insert(*slot, ty);
+            }
         }
         Stmt::TempAssign { id, ty, value } => {
             let actual_type = ty
@@ -909,7 +974,7 @@ fn write_stmt(out: &mut String, stmt: &Stmt, indent: usize, ctx: &mut MethodWrit
                 pad,
                 render_type_in_context(&actual_type, ctx),
                 id,
-                render_expr(value, ctx)
+                render_expr_as_type(value, &actual_type, ctx)
             );
             ctx.declared_temps.insert(*id);
         }
@@ -935,9 +1000,17 @@ fn write_stmt(out: &mut String, stmt: &Stmt, indent: usize, ctx: &mut MethodWrit
         Stmt::Break => {
             let _ = writeln!(out, "{}break;", pad);
         }
+        Stmt::Continue => {
+            let _ = writeln!(out, "{}continue;", pad);
+        }
         Stmt::Return(value) => {
             if let Some(value) = value {
-                let _ = writeln!(out, "{}return {};", pad, render_expr(value, ctx));
+                let _ = writeln!(
+                    out,
+                    "{}return {};",
+                    pad,
+                    render_expr_as_type(value, &ctx.method.parsed_descriptor.return_type, ctx)
+                );
             } else {
                 let _ = writeln!(out, "{}return;", pad);
             }
@@ -962,6 +1035,66 @@ fn write_stmt(out: &mut String, stmt: &Stmt, indent: usize, ctx: &mut MethodWrit
         Stmt::Comment(message) => {
             let _ = writeln!(out, "{}/* {} */", pad, message);
         }
+    }
+}
+
+fn render_for_init(init: &[Stmt], ctx: &mut MethodWriteContext<'_>) -> String {
+    if init.is_empty() {
+        return String::new();
+    }
+    if init.len() == 1 {
+        match &init[0] {
+            Stmt::Assign {
+                target: StructuredExpr::Var(slot),
+                value,
+            } if !ctx.declared_slots.contains(slot) => {
+                ctx.declared_slots.insert(*slot);
+                let ty = ctx
+                    .method
+                    .slot_type(*slot)
+                    .or_else(|| infer_expr_type(value, ctx))
+                    .unwrap_or(Type::Object("java/lang/Object".to_string()));
+                return format!(
+                    "{} {} = {}",
+                    render_type_in_context(&ty, ctx),
+                    ctx.method.slot_name(*slot),
+                    render_expr(value, ctx)
+                );
+            }
+            stmt => return render_for_update(stmt, ctx),
+        }
+    }
+    init.iter()
+        .map(|stmt| render_for_update(stmt, ctx))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn render_for_update(stmt: &Stmt, ctx: &MethodWriteContext<'_>) -> String {
+    match stmt {
+        Stmt::Assign { target, value } => {
+            format!("{} = {}", render_expr(target, ctx), render_expr(value, ctx))
+        }
+        Stmt::Expr(expr) => render_expr(expr, ctx),
+        Stmt::TempAssign { id, value, .. } => {
+            format!("tmp{} = {}", id, render_expr(value, ctx))
+        }
+        Stmt::Comment(message) => format!("/* {} */", message),
+        Stmt::Break => "break".to_string(),
+        Stmt::Continue => "continue".to_string(),
+        Stmt::Return(Some(expr)) => format!("return {}", render_expr(expr, ctx)),
+        Stmt::Return(None) => "return".to_string(),
+        Stmt::Throw(expr) => format!("throw {}", render_expr(expr, ctx)),
+        Stmt::ConstructorCall { is_super, args } => format!(
+            "{}({})",
+            if *is_super { "super" } else { "this" },
+            args.iter()
+                .map(|arg| render_expr(arg, ctx))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Stmt::MonitorEnter(expr) => format!("/* monitorenter {} */", render_expr(expr, ctx)),
+        Stmt::MonitorExit(expr) => format!("/* monitorexit {} */", render_expr(expr, ctx)),
     }
 }
 
@@ -1153,6 +1286,17 @@ fn render_expr(expr: &StructuredExpr, ctx: &MethodWriteContext<'_>) -> String {
     }
 }
 
+fn render_expr_as_type(expr: &StructuredExpr, ty: &Type, ctx: &MethodWriteContext<'_>) -> String {
+    if matches!(ty, Type::Boolean) {
+        match expr {
+            StructuredExpr::Literal(Literal::Int(0)) => return "false".to_string(),
+            StructuredExpr::Literal(Literal::Int(1)) => return "true".to_string(),
+            _ => {}
+        }
+    }
+    render_expr(expr, ctx)
+}
+
 fn render_literal(literal: &Literal) -> String {
     match literal {
         Literal::Null => "null".to_string(),
@@ -1286,6 +1430,7 @@ fn render_lambda_with_owner(
         method,
         ctx.resolver,
         HashSet::new(),
+        HashMap::new(),
         slot_overrides,
         this_override,
     );
@@ -1394,6 +1539,20 @@ fn structured_stmt_contains_lambda(stmt: &StructuredStmt) -> bool {
         StructuredStmt::While { condition, body } => {
             expr_contains_lambda(condition) || structured_stmt_contains_lambda(body)
         }
+        StructuredStmt::DoWhile { condition, body } => {
+            expr_contains_lambda(condition) || structured_stmt_contains_lambda(body)
+        }
+        StructuredStmt::For {
+            init,
+            condition,
+            update,
+            body,
+        } => {
+            init.iter().any(stmt_contains_lambda)
+                || expr_contains_lambda(condition)
+                || update.iter().any(stmt_contains_lambda)
+                || structured_stmt_contains_lambda(body)
+        }
         StructuredStmt::ForEach { iterable, body, .. } => {
             expr_contains_lambda(iterable) || structured_stmt_contains_lambda(body)
         }
@@ -1411,7 +1570,7 @@ fn stmt_contains_lambda(stmt: &Stmt) -> bool {
         | Stmt::Throw(value) => expr_contains_lambda(value),
         Stmt::Return(Some(value)) => expr_contains_lambda(value),
         Stmt::ConstructorCall { args, .. } => args.iter().any(expr_contains_lambda),
-        Stmt::Return(None) | Stmt::Break | Stmt::Comment(_) => false,
+        Stmt::Return(None) | Stmt::Break | Stmt::Continue | Stmt::Comment(_) => false,
     }
 }
 
@@ -1563,7 +1722,11 @@ fn render_internal_name_for_site(
 fn infer_expr_type(expr: &StructuredExpr, ctx: &MethodWriteContext<'_>) -> Option<Type> {
     match expr {
         StructuredExpr::This => None,
-        StructuredExpr::Var(slot) => ctx.method.slot_type(*slot),
+        StructuredExpr::Var(slot) => ctx
+            .slot_types
+            .get(slot)
+            .cloned()
+            .or_else(|| ctx.method.slot_type(*slot)),
         StructuredExpr::Temp(id) => ctx.temp_types.get(id).cloned(),
         StructuredExpr::CaughtException(ty) => ty.clone(),
         StructuredExpr::Literal(literal) => Some(match literal {

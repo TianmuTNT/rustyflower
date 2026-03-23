@@ -33,6 +33,16 @@ pub enum StructuredStmt {
         condition: StructuredExpr,
         body: Box<StructuredStmt>,
     },
+    DoWhile {
+        condition: StructuredExpr,
+        body: Box<StructuredStmt>,
+    },
+    For {
+        init: Vec<Stmt>,
+        condition: StructuredExpr,
+        update: Vec<Stmt>,
+        body: Box<StructuredStmt>,
+    },
     ForEach {
         var_type: Type,
         var_name: String,
@@ -87,6 +97,10 @@ pub fn decompile_method(class: &LoadedClass, method: &LoadedMethod) -> Result<St
         GotoHandling::comment(),
     )?);
     Ok(rewrite_synchronized_stmt(root))
+}
+
+pub fn rewrite_control_flow(stmt: StructuredStmt) -> StructuredStmt {
+    rewrite_control_flow_stmt(stmt)
 }
 
 pub fn decompile_expression_fallback(
@@ -302,6 +316,7 @@ fn is_boolean_false(expr: &StructuredExpr) -> bool {
 struct GotoHandling {
     suppressed: Vec<u16>,
     break_target: Option<u16>,
+    continue_target: Option<u16>,
 }
 
 impl GotoHandling {
@@ -309,6 +324,7 @@ impl GotoHandling {
         Self {
             suppressed: Vec::new(),
             break_target: None,
+            continue_target: None,
         }
     }
 
@@ -316,6 +332,7 @@ impl GotoHandling {
         Self {
             suppressed: vec![target],
             break_target: None,
+            continue_target: None,
         }
     }
 
@@ -323,6 +340,23 @@ impl GotoHandling {
         Self {
             suppressed: Vec::new(),
             break_target: Some(target),
+            continue_target: None,
+        }
+    }
+
+    fn continue_to(target: u16) -> Self {
+        Self {
+            suppressed: Vec::new(),
+            break_target: None,
+            continue_target: Some(target),
+        }
+    }
+
+    fn loop_targets(continue_target: u16, break_target: u16) -> Self {
+        Self {
+            suppressed: Vec::new(),
+            break_target: Some(break_target),
+            continue_target: Some(continue_target),
         }
     }
 
@@ -377,6 +411,30 @@ impl<'a> Builder<'a> {
                 continue;
             }
             if let Some((stmt, next_pos, consumed)) =
+                self.try_build_do_while(pos, end_pos, goto_handling.clone())?
+            {
+                self.visited.extend(consumed);
+                statements.push(stmt);
+                pos = next_pos;
+                continue;
+            }
+            if let Some((stmt, next_pos, consumed)) =
+                self.try_build_chained_while(pos, end_pos, goto_handling.clone())?
+            {
+                self.visited.extend(consumed);
+                statements.push(stmt);
+                pos = next_pos;
+                continue;
+            }
+            if let Some((stmt, next_pos, consumed)) =
+                self.try_build_chained_if(pos, end_pos, goto_handling.clone())?
+            {
+                self.visited.extend(consumed);
+                statements.push(stmt);
+                pos = next_pos;
+                continue;
+            }
+            if let Some((stmt, next_pos, consumed)) =
                 self.try_build_while(pos, end_pos, goto_handling.clone())?
             {
                 self.visited.extend(consumed);
@@ -409,6 +467,8 @@ impl<'a> Builder<'a> {
                 if goto_handling.suppressed.contains(target) {
                 } else if goto_handling.break_target == Some(*target) {
                     stmts.push(Stmt::Break);
+                } else if goto_handling.continue_target == Some(*target) {
+                    stmts.push(Stmt::Continue);
                 } else {
                     stmts.push(Stmt::Comment(format!(
                     "rustyflower: unsupported goto to offset {target}"
@@ -947,10 +1007,11 @@ impl<'a> Builder<'a> {
                 return Ok(None);
             }
 
+            let exit_offset = self.cfg.blocks[self.cfg.order[exit_pos]].start_offset;
             let body_stmts = self.build_range(
                 body_start_pos,
                 condition_pos,
-                GotoHandling::suppress(*condition_target),
+                GotoHandling::loop_targets(*condition_target, exit_offset),
             )?;
             let while_stmt = StructuredStmt::While {
                 condition: loop_condition,
@@ -999,27 +1060,24 @@ impl<'a> Builder<'a> {
         };
 
         let loop_header_offset = self.cfg.blocks[block_id].start_offset;
-        let mut backedge_pos = None;
-        for candidate_pos in body_start_pos..exit_pos {
+        let has_backedge = (body_start_pos..exit_pos).any(|candidate_pos| {
             let candidate_id = self.cfg.order[candidate_pos];
-            if matches!(
+            matches!(
                 self.semantics[candidate_id].terminator,
                 Terminator::Goto(target) if target == loop_header_offset
-            ) {
-                backedge_pos = Some(candidate_pos);
-            }
-        }
-        let Some(backedge_pos) = backedge_pos else {
+            )
+        });
+        if !has_backedge {
             return Ok(None);
-        };
-
+        }
+        let exit_offset = self.cfg.blocks[self.cfg.order[exit_pos]].start_offset;
         let body_stmts = self.build_range(
             body_start_pos,
-            backedge_pos + 1,
-            GotoHandling::suppress(loop_header_offset),
+            exit_pos,
+            GotoHandling::loop_targets(loop_header_offset, exit_offset),
         )?;
         let mut consumed = vec![block_id];
-        for region_pos in body_start_pos..=backedge_pos {
+        for region_pos in body_start_pos..exit_pos {
             consumed.push(self.cfg.order[region_pos]);
         }
         let while_stmt = StructuredStmt::While {
@@ -1035,6 +1093,321 @@ impl<'a> Builder<'a> {
             ])
         };
         Ok(Some((stmt, exit_pos, consumed)))
+    }
+
+    fn try_build_do_while(
+        &mut self,
+        pos: usize,
+        end_pos: usize,
+        _goto_handling: GotoHandling,
+    ) -> Result<Option<(StructuredStmt, usize, Vec<usize>)>> {
+        let block_id = self.cfg.order[pos];
+        let start_offset = self.cfg.blocks[block_id].start_offset;
+
+        for condition_pos in (pos + 1)..end_pos {
+            let condition_block_id = self.cfg.order[condition_pos];
+            let Terminator::If {
+                condition,
+                jump_target,
+                fallthrough_target,
+            } = &self.semantics[condition_block_id].terminator
+            else {
+                continue;
+            };
+            let condition_offset = self.cfg.blocks[condition_block_id].start_offset;
+            let (loop_condition, exit_pos) = if *jump_target == start_offset {
+                (condition.clone(), self.position_for_offset(*fallthrough_target)?)
+            } else if *fallthrough_target == start_offset {
+                (
+                    negate_condition(condition.clone()),
+                    self.position_for_offset(*jump_target)?,
+                )
+            } else {
+                continue;
+            };
+            if exit_pos <= condition_pos || exit_pos > end_pos {
+                continue;
+            }
+
+            let exit_offset = self.cfg.blocks[self.cfg.order[exit_pos]].start_offset;
+            let body_stmts = self.build_range(
+                pos,
+                condition_pos,
+                GotoHandling::loop_targets(condition_offset, exit_offset),
+            )?;
+            let stmt = StructuredStmt::DoWhile {
+                condition: loop_condition,
+                body: Box::new(wrap_sequence(body_stmts)),
+            };
+            let consumed = (pos..=condition_pos)
+                .map(|region_pos| self.cfg.order[region_pos])
+                .collect::<Vec<_>>();
+            return Ok(Some((stmt, exit_pos, consumed)));
+        }
+
+        let Terminator::If {
+            condition,
+            jump_target,
+            fallthrough_target,
+        } = &self.semantics[block_id].terminator
+        else {
+            return Ok(None);
+        };
+        if self.semantics[block_id].stmts.is_empty() {
+            return Ok(None);
+        }
+
+        if *jump_target == start_offset || *fallthrough_target == start_offset {
+            let (loop_condition, exit_pos) = if *jump_target == start_offset {
+                (condition.clone(), self.position_for_offset(*fallthrough_target)?)
+            } else {
+                (
+                    negate_condition(condition.clone()),
+                    self.position_for_offset(*jump_target)?,
+                )
+            };
+            if exit_pos <= pos || exit_pos > end_pos {
+                return Ok(None);
+            }
+            let mut body_items = Vec::new();
+            if !self.semantics[block_id].stmts.is_empty() {
+                body_items.push(StructuredStmt::Basic(self.semantics[block_id].stmts.clone()));
+            }
+            let stmt = StructuredStmt::DoWhile {
+                condition: loop_condition,
+                body: Box::new(wrap_sequence(body_items)),
+            };
+            return Ok(Some((stmt, exit_pos, vec![block_id])));
+        }
+
+        let next_pos = pos + 1;
+        if next_pos >= end_pos {
+            return Ok(None);
+        }
+        let next_block_id = self.cfg.order[next_pos];
+        let next_offset = self.cfg.blocks[next_block_id].start_offset;
+        let Terminator::Goto(target) = self.semantics[next_block_id].terminator else {
+            return Ok(None);
+        };
+        if target != start_offset {
+            return Ok(None);
+        }
+
+        let (loop_condition, exit_pos) = if *jump_target == next_offset {
+            (condition.clone(), self.position_for_offset(*fallthrough_target)?)
+        } else if *fallthrough_target == next_offset {
+            (
+                negate_condition(condition.clone()),
+                self.position_for_offset(*jump_target)?,
+            )
+        } else {
+            return Ok(None);
+        };
+        if exit_pos <= next_pos || exit_pos > end_pos {
+            return Ok(None);
+        }
+
+        let mut body_items = Vec::new();
+        if !self.semantics[block_id].stmts.is_empty() {
+            body_items.push(StructuredStmt::Basic(self.semantics[block_id].stmts.clone()));
+        }
+        let stmt = StructuredStmt::DoWhile {
+            condition: loop_condition,
+            body: Box::new(wrap_sequence(body_items)),
+        };
+        Ok(Some((stmt, exit_pos, vec![block_id, next_block_id])))
+    }
+
+    fn try_build_chained_while(
+        &mut self,
+        pos: usize,
+        end_pos: usize,
+        _goto_handling: GotoHandling,
+    ) -> Result<Option<(StructuredStmt, usize, Vec<usize>)>> {
+        let block_id = self.cfg.order[pos];
+        let start_offset = self.cfg.blocks[block_id].start_offset;
+        if !self.semantics[block_id].stmts.is_empty() {
+            return Ok(None);
+        }
+
+        let mut backedge_pos = None;
+        for candidate_pos in (pos + 1)..end_pos {
+            let candidate_id = self.cfg.order[candidate_pos];
+            if matches!(
+                self.semantics[candidate_id].terminator,
+                Terminator::Goto(target) if target == start_offset
+            ) {
+                backedge_pos = Some(candidate_pos);
+            }
+        }
+        let Some(backedge_pos) = backedge_pos else {
+            return Ok(None);
+        };
+        let exit_pos = backedge_pos + 1;
+        if exit_pos >= end_pos {
+            return Ok(None);
+        }
+        let Some(body_start_pos) = ((pos + 1)..=backedge_pos).find(|candidate_pos| {
+            let candidate_id = self.cfg.order[*candidate_pos];
+            !self.semantics[candidate_id].stmts.is_empty()
+        }) else {
+            return Ok(None);
+        };
+
+        let body_start_offset = self.cfg.blocks[self.cfg.order[body_start_pos]].start_offset;
+        let exit_offset = self.cfg.blocks[self.cfg.order[exit_pos]].start_offset;
+        let mut visiting = HashSet::new();
+        let Some(condition) = self.build_branch_expression(
+            block_id,
+            body_start_offset,
+            exit_offset,
+            &mut visiting,
+        ) else {
+            return Ok(None);
+        };
+
+        let body_stmts = self.build_range(
+            body_start_pos,
+            exit_pos,
+            GotoHandling::loop_targets(start_offset, exit_offset),
+        )?;
+        let stmt = StructuredStmt::While {
+            condition,
+            body: Box::new(wrap_sequence(body_stmts)),
+        };
+        let consumed = (pos..exit_pos)
+            .map(|region_pos| self.cfg.order[region_pos])
+            .collect::<Vec<_>>();
+        Ok(Some((stmt, exit_pos, consumed)))
+    }
+
+    fn try_build_chained_if(
+        &mut self,
+        pos: usize,
+        end_pos: usize,
+        goto_handling: GotoHandling,
+    ) -> Result<Option<(StructuredStmt, usize, Vec<usize>)>> {
+        let block_id = self.cfg.order[pos];
+        if !self.semantics[block_id].stmts.is_empty() {
+            return Ok(None);
+        }
+        if !matches!(self.semantics[block_id].terminator, Terminator::If { .. }) {
+            return Ok(None);
+        }
+        let start_offset = self.cfg.blocks[block_id].start_offset;
+        let has_backedge = ((pos + 1)..end_pos).any(|candidate_pos| {
+            let candidate_id = self.cfg.order[candidate_pos];
+            matches!(
+                self.semantics[candidate_id].terminator,
+                Terminator::Goto(target) if target == start_offset
+            )
+        });
+        if has_backedge {
+            return Ok(None);
+        }
+
+        let Some(body_start_pos) = ((pos + 1)..end_pos).find(|candidate_pos| {
+            let candidate_id = self.cfg.order[*candidate_pos];
+            !self.semantics[candidate_id].stmts.is_empty()
+        }) else {
+            return Ok(None);
+        };
+        let body_start_id = self.cfg.order[body_start_pos];
+        let exit_pos = match self.semantics[body_start_id].terminator {
+            Terminator::Fallthrough(Some(exit_offset)) => self.position_for_offset(exit_offset)?,
+            Terminator::Throw(_) | Terminator::Return(_) => body_start_pos + 1,
+            _ => return Ok(None),
+        };
+        if exit_pos <= body_start_pos || exit_pos > end_pos {
+            return Ok(None);
+        }
+        let exit_offset = self.cfg.blocks[self.cfg.order[exit_pos]].start_offset;
+
+        let mut visiting = HashSet::new();
+        let Some(condition) = self.build_branch_expression(
+            block_id,
+            self.cfg.blocks[body_start_id].start_offset,
+            exit_offset,
+            &mut visiting,
+        ) else {
+            return Ok(None);
+        };
+        let then_body = self.build_range(body_start_pos, exit_pos, goto_handling)?;
+        let if_stmt = StructuredStmt::If {
+            condition,
+            then_branch: Box::new(wrap_sequence(then_body)),
+            else_branch: None,
+        };
+        let consumed = (pos..exit_pos)
+            .map(|region_pos| self.cfg.order[region_pos])
+            .collect::<Vec<_>>();
+        Ok(Some((if_stmt, exit_pos, consumed)))
+    }
+
+    fn build_branch_expression(
+        &self,
+        block_id: usize,
+        true_offset: u16,
+        false_offset: u16,
+        visiting: &mut HashSet<usize>,
+    ) -> Option<StructuredExpr> {
+        if !visiting.insert(block_id) {
+            return None;
+        }
+        let semantics = &self.semantics[block_id];
+        let expr = if !semantics.stmts.is_empty() {
+            None
+        } else {
+            match &semantics.terminator {
+                Terminator::If {
+                    condition,
+                    jump_target,
+                    fallthrough_target,
+                } => {
+                    let on_jump =
+                        self.resolve_branch_target(*jump_target, true_offset, false_offset, visiting)?;
+                    let on_fall = self.resolve_branch_target(
+                        *fallthrough_target,
+                        true_offset,
+                        false_offset,
+                        visiting,
+                    )?;
+                    Some(combine_conditional_expression(
+                        condition.clone(),
+                        on_jump,
+                        on_fall,
+                        &Type::Boolean,
+                    ))
+                }
+                Terminator::Goto(target) => {
+                    self.resolve_branch_target(*target, true_offset, false_offset, visiting)
+                }
+                _ => None,
+            }
+        };
+        visiting.remove(&block_id);
+        expr
+    }
+
+    fn resolve_branch_target(
+        &self,
+        target: u16,
+        true_offset: u16,
+        false_offset: u16,
+        visiting: &mut HashSet<usize>,
+    ) -> Option<StructuredExpr> {
+        if target == true_offset {
+            return Some(StructuredExpr::Literal(crate::expr::Literal::Boolean(
+                true,
+            )));
+        }
+        if target == false_offset {
+            return Some(StructuredExpr::Literal(crate::expr::Literal::Boolean(
+                false,
+            )));
+        }
+        let target_block = self.cfg.block_by_offset(target)?;
+        self.build_branch_expression(target_block.id, true_offset, false_offset, visiting)
     }
 
     fn try_build_if(
@@ -1112,32 +1485,77 @@ impl<'a> Builder<'a> {
             _ => None,
         };
 
-        let (then_end_pos, else_branch, next_pos_after, consumed) =
+        let (then_branch, else_branch, next_pos_after, consumed) =
             if let Some(merge_target) = else_goto {
                 let merge_pos = self.position_for_offset(merge_target)?;
                 if merge_pos <= split_pos {
+                    if goto_handling.break_target == Some(merge_target)
+                        || goto_handling.continue_target == Some(merge_target)
+                    {
+                        let then_body =
+                            self.build_range(then_start_pos, split_pos, goto_handling.clone())?;
+                        let else_body =
+                            self.build_range(split_pos, end_pos, goto_handling.clone())?;
+                        let mut consumed = vec![block_id];
+                        for region_pos in then_start_pos..end_pos {
+                            consumed.push(self.cfg.order[region_pos]);
+                        }
+                        let then_branch = if else_is_jump_target {
+                            wrap_sequence(then_body.clone())
+                        } else {
+                            wrap_sequence(else_body.clone())
+                        };
+                        let else_branch = if else_is_jump_target {
+                            Some(wrap_sequence(else_body))
+                        } else {
+                            Some(wrap_sequence(then_body))
+                        };
+                        let if_stmt = StructuredStmt::If {
+                            condition: source_condition,
+                            then_branch: Box::new(then_branch),
+                            else_branch: else_branch.map(Box::new),
+                        };
+                        let stmt = if self.semantics[block_id].stmts.is_empty() {
+                            if_stmt
+                        } else {
+                            StructuredStmt::Sequence(vec![
+                                StructuredStmt::Basic(self.semantics[block_id].stmts.clone()),
+                                if_stmt,
+                            ])
+                        };
+                        return Ok(Some((stmt, end_pos, consumed)));
+                    }
                     return Ok(None);
                 }
+                let then_goto_handling =
+                    if goto_handling.break_target == Some(merge_target)
+                        || goto_handling.continue_target == Some(merge_target)
+                    {
+                        goto_handling.clone()
+                    } else {
+                        goto_handling.with_suppressed(merge_target)
+                    };
                 let then_body = self.build_range(
                     then_start_pos,
                     split_pos,
-                    GotoHandling::suppress(merge_target),
+                    then_goto_handling,
                 )?;
                 let else_body = self.build_range(split_pos, merge_pos, goto_handling.clone())?;
                 let mut consumed = vec![block_id];
                 for region_pos in then_start_pos..merge_pos {
                     consumed.push(self.cfg.order[region_pos]);
                 }
-                (
-                    split_pos,
-                    Some(wrap_sequence(if else_is_jump_target {
-                        else_body
-                    } else {
-                        then_body.clone()
-                    })),
-                    merge_pos,
-                    consumed,
-                )
+                let then_branch = if else_is_jump_target {
+                    wrap_sequence(then_body.clone())
+                } else {
+                    wrap_sequence(else_body.clone())
+                };
+                let else_branch = if else_is_jump_target {
+                    Some(wrap_sequence(else_body))
+                } else {
+                    Some(wrap_sequence(then_body))
+                };
+                (then_branch, else_branch, merge_pos, consumed)
             } else {
                 let then_body = self.build_range(then_start_pos, split_pos, goto_handling.clone())?;
                 let mut consumed = vec![block_id];
@@ -1160,22 +1578,9 @@ impl<'a> Builder<'a> {
                 return Ok(Some((stmt, split_pos, consumed)));
             };
 
-        let then_body = if else_is_jump_target {
-            self.build_range(
-                then_start_pos,
-                then_end_pos,
-                GotoHandling::suppress(
-                    self.cfg.blocks[self.cfg.order[next_pos_after]].start_offset,
-                ),
-            )
-            .unwrap_or_default()
-        } else {
-            self.build_range(split_pos, next_pos_after, goto_handling.clone())
-                .unwrap_or_default()
-        };
         let if_stmt = StructuredStmt::If {
             condition: source_condition,
-            then_branch: Box::new(wrap_sequence(then_body)),
+            then_branch: Box::new(then_branch),
             else_branch: else_branch.map(Box::new),
         };
         let stmt = if self.semantics[block_id].stmts.is_empty() {
@@ -1436,6 +1841,227 @@ fn rewrite_synchronized_sequence(items: Vec<StructuredStmt>) -> StructuredStmt {
         index += 1;
     }
     wrap_sequence(output)
+}
+
+fn rewrite_control_flow_stmt(stmt: StructuredStmt) -> StructuredStmt {
+    match stmt {
+        StructuredStmt::Sequence(items) => rewrite_control_flow_sequence(items),
+        StructuredStmt::Try {
+            try_body,
+            catches,
+            finally_body,
+        } => StructuredStmt::Try {
+            try_body: Box::new(rewrite_control_flow_stmt(*try_body)),
+            catches: catches
+                .into_iter()
+                .map(|catch| CatchArm {
+                    catch_type: catch.catch_type,
+                    catch_var: catch.catch_var,
+                    body: Box::new(rewrite_control_flow_stmt(*catch.body)),
+                })
+                .collect(),
+            finally_body: finally_body.map(|body| Box::new(rewrite_control_flow_stmt(*body))),
+        },
+        StructuredStmt::Switch { expr, arms } => StructuredStmt::Switch {
+            expr,
+            arms: arms
+                .into_iter()
+                .map(|arm| SwitchArm {
+                    labels: arm.labels,
+                    has_default: arm.has_default,
+                    body: Box::new(rewrite_control_flow_stmt(*arm.body)),
+                })
+                .collect(),
+        },
+        StructuredStmt::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => StructuredStmt::If {
+            condition,
+            then_branch: Box::new(rewrite_control_flow_stmt(*then_branch)),
+            else_branch: else_branch.map(|branch| Box::new(rewrite_control_flow_stmt(*branch))),
+        },
+        StructuredStmt::While { condition, body } => StructuredStmt::While {
+            condition,
+            body: Box::new(strip_terminal_continue(rewrite_control_flow_stmt(*body))),
+        },
+        StructuredStmt::DoWhile { condition, body } => StructuredStmt::DoWhile {
+            condition,
+            body: Box::new(strip_terminal_continue(rewrite_control_flow_stmt(*body))),
+        },
+        StructuredStmt::For {
+            init,
+            condition,
+            update,
+            body,
+        } => StructuredStmt::For {
+            init,
+            condition,
+            update,
+            body: Box::new(strip_terminal_continue(rewrite_control_flow_stmt(*body))),
+        },
+        StructuredStmt::ForEach {
+            var_type,
+            var_name,
+            iterable,
+            body,
+        } => StructuredStmt::ForEach {
+            var_type,
+            var_name,
+            iterable,
+            body: Box::new(strip_terminal_continue(rewrite_control_flow_stmt(*body))),
+        },
+        other => other,
+    }
+}
+
+fn rewrite_control_flow_sequence(items: Vec<StructuredStmt>) -> StructuredStmt {
+    let rewritten = items
+        .into_iter()
+        .map(rewrite_control_flow_stmt)
+        .flat_map(top_level_items)
+        .collect::<Vec<_>>();
+    let mut output = Vec::new();
+    let mut index = 0;
+    while index < rewritten.len() {
+        if let Some((stmt, consumed)) = try_rewrite_for_loop(&rewritten[index..]) {
+            output.push(stmt);
+            index += consumed;
+            continue;
+        }
+        output.push(rewritten[index].clone());
+        index += 1;
+    }
+    wrap_sequence(output)
+}
+
+fn try_rewrite_for_loop(items: &[StructuredStmt]) -> Option<(StructuredStmt, usize)> {
+    if items.len() < 2 {
+        return None;
+    }
+    let StructuredStmt::Basic(init) = &items[0] else {
+        return None;
+    };
+    if init.len() != 1 {
+        return None;
+    }
+    let StructuredStmt::While { condition, body } = &items[1] else {
+        return None;
+    };
+    let init_slot = stmt_target_slot(&init[0])?;
+    let (body_without_update, update) = extract_for_update(*body.clone(), init_slot)?;
+    let body = rewrite_for_continue_body(body_without_update);
+    Some((
+        StructuredStmt::For {
+            init: init.clone(),
+            condition: condition.clone(),
+            update,
+            body: Box::new(body),
+        },
+        2,
+    ))
+}
+
+fn extract_for_update(body: StructuredStmt, slot: u16) -> Option<(StructuredStmt, Vec<Stmt>)> {
+    match body {
+        StructuredStmt::Basic(mut stmts) => {
+            let last = stmts.last()?;
+            if stmt_target_slot(last) != Some(slot) {
+                return None;
+            }
+            let update = vec![stmts.pop()?];
+            let body = if stmts.is_empty() {
+                StructuredStmt::Empty
+            } else {
+                StructuredStmt::Basic(stmts)
+            };
+            Some((body, update))
+        }
+        StructuredStmt::Sequence(mut items) => {
+            let last = items.pop()?;
+            let (rewritten_last, update) = extract_for_update(last, slot)?;
+            if !matches!(rewritten_last, StructuredStmt::Empty) {
+                items.push(rewritten_last);
+            }
+            Some((wrap_sequence(items), update))
+        }
+        _ => None,
+    }
+}
+
+fn rewrite_for_continue_body(body: StructuredStmt) -> StructuredStmt {
+    match body {
+        StructuredStmt::If {
+            condition,
+            then_branch,
+            else_branch: Some(else_branch),
+        } if is_structurally_empty(&then_branch) => wrap_sequence(vec![
+            StructuredStmt::If {
+                condition,
+                then_branch: Box::new(StructuredStmt::Basic(vec![Stmt::Continue])),
+                else_branch: None,
+            },
+            rewrite_for_continue_body(*else_branch),
+        ]),
+        StructuredStmt::Sequence(mut items) => {
+            if let Some(last) = items.pop() {
+                let rewritten_last = rewrite_for_continue_body(last);
+                if !matches!(rewritten_last, StructuredStmt::Empty) {
+                    items.push(rewritten_last);
+                }
+            }
+            wrap_sequence(items)
+        }
+        other => other,
+    }
+}
+
+fn is_structurally_empty(stmt: &StructuredStmt) -> bool {
+    match stmt {
+        StructuredStmt::Empty => true,
+        StructuredStmt::Basic(stmts) => stmts.is_empty(),
+        StructuredStmt::Sequence(items) => items.iter().all(is_structurally_empty),
+        _ => false,
+    }
+}
+
+fn strip_terminal_continue(stmt: StructuredStmt) -> StructuredStmt {
+    match stmt {
+        StructuredStmt::Basic(mut stmts) => {
+            while matches!(stmts.last(), Some(Stmt::Continue)) {
+                stmts.pop();
+            }
+            if stmts.is_empty() {
+                StructuredStmt::Empty
+            } else {
+                StructuredStmt::Basic(stmts)
+            }
+        }
+        StructuredStmt::Sequence(mut items) => {
+            while matches!(items.last(), Some(StructuredStmt::Empty)) {
+                items.pop();
+            }
+            if let Some(last) = items.pop() {
+                let stripped = strip_terminal_continue(last);
+                if !matches!(stripped, StructuredStmt::Empty) {
+                    items.push(stripped);
+                }
+            }
+            wrap_sequence(items)
+        }
+        other => other,
+    }
+}
+
+fn stmt_target_slot(stmt: &Stmt) -> Option<u16> {
+    match stmt {
+        Stmt::Assign {
+            target: StructuredExpr::Var(slot),
+            ..
+        } => Some(*slot),
+        _ => None,
+    }
 }
 
 fn try_fold_synchronized_pair(items: &[StructuredStmt]) -> Option<(StructuredStmt, usize)> {

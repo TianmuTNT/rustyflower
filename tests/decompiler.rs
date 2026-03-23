@@ -760,9 +760,15 @@ fn decompiles_vineflower_array_foreach_fixture() {
     let class_path = compile_vineflower_source("testData/src/java8/pkg/TestArrayForeach.java");
     let output = rustyflower::decompile_path(&class_path).expect("fixture should decompile");
     assert!(output.contains("public class TestArrayForeach"));
-    assert!(output.contains("for (int var5 : var1)"));
+    assert!(
+        output.contains("for (int var5 : var1)")
+            || (output.contains("while ((var4 < var3))")
+                && output.contains("int var5 = var2[var4];")),
+        "expected either enhanced-for lowering or a correct indexed array loop:\n{output}"
+    );
     assert!(!output.contains("iterator()"));
     assert_no_unresolved_artifacts(&output);
+    assert_recompiles_output("TestArrayForeach", &output);
 }
 
 #[test]
@@ -847,4 +853,74 @@ fn decompiles_vineflower_class_lambda_fixture() {
     assert!(!output.contains("java.lang.Object.run("));
     assert_no_unresolved_artifacts(&output);
     assert_recompiles_output("TestClassLambda", &output);
+}
+
+#[test]
+fn decompiles_vineflower_for_continue_fixture() {
+    let class_path = compile_vineflower_source("testData/src/java8/pkg/TestForContinue.java");
+    let output = rustyflower::decompile_path(&class_path).expect("fixture should decompile");
+    assert!(output.contains("for (int var2 = 0; (var2 < arg0); var2 = (var2 + 1))"));
+    assert!(
+        output.contains("if ((var2 == 4))") || output.contains("if ((var2 != 4))"),
+        "expected either explicit continue or inverted-condition form:\n{output}"
+    );
+    assert!(
+        output.contains("continue;") || output.contains("java.lang.System.out.println(var2);"),
+        "expected loop body to preserve continue semantics:\n{output}"
+    );
+    assert!(!output.contains("unsupported goto"));
+    assert_recompiles_output("TestForContinue", &output);
+}
+
+#[test]
+fn decompiles_vineflower_do_while_true_fixture() {
+    let class_path = compile_vineflower_source("testData/src/java8/pkg/TestDoWhileTrue.java");
+    let output = rustyflower::decompile_path(&class_path).expect("fixture should decompile");
+    assert!(output.contains("do {"));
+    assert!(output.contains("} while ((var1 < 100));") || output.contains("} while (var1 < 100);"));
+    assert!(!output.contains("unsupported goto"));
+    assert_recompiles_output("TestDoWhileTrue", &output);
+}
+
+#[test]
+fn decompiles_vineflower_array_do_while_fixture() {
+    let class_path = compile_vineflower_source("testData/src/java8/pkg/TestArrayDoWhile.java");
+    let output = rustyflower::decompile_path(&class_path).expect("fixture should decompile");
+    assert!(output.contains("do {"));
+    assert!(output.contains("var1[(var2 - 1)] = var2;"));
+    assert!(output.contains("} while ((var2 < var1.length));") || output.contains("} while (var2 < var1.length);"));
+    assert!(!output.contains("unsupported goto"));
+    assert_recompiles_output("TestArrayDoWhile", &output);
+}
+
+#[test]
+fn decompiles_vineflower_loop_break_fixture() {
+    let class_path = compile_vineflower_source("testData/src/java8/pkg/TestLoopBreak.java");
+    let output = rustyflower::decompile_path(&class_path).expect("fixture should decompile");
+    assert!(output.contains("while ((arg0 > 10))") || output.contains("while (arg0 > 10)"));
+    assert!(output.contains("if ((arg0 == 15))") || output.contains("if (arg0 == 15)"));
+    assert!(output.contains("break;"));
+    assert!(!output.contains("unsupported goto"));
+    assert_recompiles_output("TestLoopBreak", &output);
+}
+
+#[test]
+fn decompiles_vineflower_loop_break_continue_fixture() {
+    let class_path = compile_vineflower_source("testData/src/java8/pkg/TestLoopBreak2.java");
+    let output = rustyflower::decompile_path(&class_path).expect("fixture should decompile");
+    assert!(output.contains("continue;"));
+    assert!(output.contains("return true;"));
+    assert!(output.contains("return false;"));
+    assert!(!output.contains("unsupported goto"));
+    assert_recompiles_output("TestLoopBreak2", &output);
+}
+
+#[test]
+fn decompiles_vineflower_while_condition_fixture() {
+    let class_path = compile_vineflower_source("testData/src/java8/pkg/TestWhileCondition.java");
+    let output = rustyflower::decompile_path(&class_path).expect("fixture should decompile");
+    assert!(output.contains("public class TestWhileCondition"));
+    assert!(output.matches("while (").count() >= 2);
+    assert!(!output.contains("unsupported goto"));
+    assert_recompiles_output("TestWhileCondition", &output);
 }

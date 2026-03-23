@@ -149,6 +149,7 @@ pub enum Stmt {
     MonitorEnter(StructuredExpr),
     MonitorExit(StructuredExpr),
     Break,
+    Continue,
     Return(Option<StructuredExpr>),
     Throw(StructuredExpr),
     ConstructorCall {
