@@ -1,4 +1,4 @@
-use crate::expr::{BinaryOp, Literal, Stmt, StructuredExpr, UnaryOp};
+use crate::expr::{BinaryOp, Literal, Stmt, StringConcatPart, StructuredExpr, UnaryOp};
 use crate::loader::{LoadedClass, LoadedConstant, LoadedField, LoadedMethod};
 use crate::lowering::{ClassPathResolver, lower_switches};
 use crate::structure::{StructuredStmt, SwitchLabel, decompile_method};
@@ -275,6 +275,9 @@ fn contains_unresolved_artifacts(stmt: &StructuredStmt) -> bool {
         StructuredStmt::While { condition, body } => {
             expr_has_unresolved_artifacts(condition) || contains_unresolved_artifacts(body)
         }
+        StructuredStmt::ForEach {
+            iterable, body, ..
+        } => expr_has_unresolved_artifacts(iterable) || contains_unresolved_artifacts(body),
         StructuredStmt::Comment(_) => true,
         StructuredStmt::Empty => false,
     }
@@ -303,6 +306,10 @@ fn expr_has_unresolved_artifacts(expr: &StructuredExpr) -> bool {
         StructuredExpr::Field { target, .. } => target
             .as_ref()
             .is_some_and(|target| expr_has_unresolved_artifacts(target)),
+        StructuredExpr::StringConcat { parts } => parts.iter().any(|part| match part {
+            StringConcatPart::Literal(_) => false,
+            StringConcatPart::Expr(expr) => expr_has_unresolved_artifacts(expr),
+        }),
         StructuredExpr::ArrayAccess { array, index } => {
             expr_has_unresolved_artifacts(array) || expr_has_unresolved_artifacts(index)
         }
@@ -452,6 +459,24 @@ fn write_structured_stmt(
             write_structured_stmt(out, body, indent + 1, ctx);
             let _ = writeln!(out, "{}}}", pad);
         }
+        StructuredStmt::ForEach {
+            var_type,
+            var_name,
+            iterable,
+            body,
+        } => {
+            let pad = "    ".repeat(indent);
+            let _ = writeln!(
+                out,
+                "{}for ({} {} : {}) {{",
+                pad,
+                format_type(var_type),
+                var_name,
+                render_expr(iterable, ctx)
+            );
+            write_structured_stmt(out, body, indent + 1, ctx);
+            let _ = writeln!(out, "{}}}", pad);
+        }
         StructuredStmt::Comment(message) => {
             let _ = writeln!(out, "{}/* {message} */", "    ".repeat(indent));
         }
@@ -573,6 +598,27 @@ fn render_expr(expr: &StructuredExpr, ctx: &MethodWriteContext<'_>) -> String {
         StructuredExpr::Temp(id) => format!("tmp{id}"),
         StructuredExpr::CaughtException(_) => "<caught-exception>".to_string(),
         StructuredExpr::Literal(literal) => render_literal(literal),
+        StructuredExpr::StringConcat { parts } => {
+            let mut rendered = parts
+                .iter()
+                .map(|part| render_string_concat_part(part, ctx))
+                .collect::<Vec<_>>();
+            let has_literal = parts
+                .iter()
+                .any(|part| matches!(part, StringConcatPart::Literal(_)));
+            if !has_literal
+                && parts
+                    .first()
+                    .is_some_and(|part| !matches!(
+                        part,
+                        StringConcatPart::Expr(expr)
+                            if matches!(infer_expr_type(expr, ctx), Some(Type::Object(name)) if name == "java/lang/String")
+                    ))
+            {
+                rendered.insert(0, "\"\"".to_string());
+            }
+            rendered.join(" + ")
+        }
         StructuredExpr::Field {
             target,
             owner,
@@ -712,8 +758,12 @@ fn infer_expr_type(expr: &StructuredExpr, ctx: &MethodWriteContext<'_>) -> Optio
             Literal::String(_) => Type::Object("java/lang/String".to_string()),
             Literal::Class(_) => Type::Object("java/lang/Class".to_string()),
         }),
+        StructuredExpr::StringConcat { .. } => Some(Type::Object("java/lang/String".to_string())),
         StructuredExpr::Field { descriptor, .. } => Some(descriptor.clone()),
-        StructuredExpr::ArrayAccess { .. } => None,
+        StructuredExpr::ArrayAccess { array, .. } => match infer_expr_type(array, ctx) {
+            Some(Type::Array(element)) => Some((*element).clone()),
+            _ => None,
+        },
         StructuredExpr::ArrayLength(_) => Some(Type::Int),
         StructuredExpr::Binary { op, left, right } => Some(match op {
             BinaryOp::Eq
@@ -739,5 +789,12 @@ fn infer_expr_type(expr: &StructuredExpr, ctx: &MethodWriteContext<'_>) -> Optio
         }
         StructuredExpr::Cast { ty, .. } => Some(ty.clone()),
         StructuredExpr::InstanceOf { .. } => Some(Type::Boolean),
+    }
+}
+
+fn render_string_concat_part(part: &StringConcatPart, ctx: &MethodWriteContext<'_>) -> String {
+    match part {
+        StringConcatPart::Literal(value) => format!("{value:?}"),
+        StringConcatPart::Expr(expr) => render_expr(expr, ctx),
     }
 }

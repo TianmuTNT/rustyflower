@@ -554,7 +554,6 @@ fn decompiles_simple_try_catch_finally() {
 #[test]
 fn decompiles_synchronized_block() {
     let bytes = class_with_single_method("pkg/TestSync", "inc", "(I)I", false, |method| {
-        let lock = Label::new();
         let body_start = Label::new();
         let body_end = Label::new();
         let handler = Label::new();
@@ -664,7 +663,9 @@ fn decompiles_vineflower_switch_in_try_fixture() {
     assert!(output.contains("while ("));
     assert!(output.contains("try {"));
     assert!(output.contains("switch ("));
+    assert!(output.contains("case \"a\":"));
     assert!(output.contains("catch (java.lang.Exception"));
+    assert!(!output.contains("hashCode()"));
     assert_no_unresolved_artifacts(&output);
 }
 
@@ -698,4 +699,69 @@ fn decompiles_java1_synchronized_fixture_with_clean_legacy_fallback() {
     );
     assert!(!output.contains("rustyflower: unsupported goto"));
     assert!(!output.contains("<caught-exception>"));
+}
+
+#[test]
+fn decompiles_vineflower_string_concat_fixture() {
+    let class_path = compile_vineflower_source("testData/src/java8/pkg/TestStringConcat.java");
+    let output = rustyflower::decompile_path(&class_path).expect("fixture should decompile");
+    assert!(output.contains("public class TestStringConcat"));
+    assert!(output.contains("return arg0 + arg1;"));
+    assert!(output.contains("\"(\" + arg0 + \"-\" + arg1"));
+    assert!(!output.contains("makeConcatWithConstants"));
+    assert_no_unresolved_artifacts(&output);
+}
+
+#[test]
+fn decompiles_vineflower_java9_string_concat_fixture() {
+    let class_path = compile_vineflower_source("testData/src/java9/pkg/TestJava9StringConcat.java");
+    let output = rustyflower::decompile_path(&class_path).expect("fixture should decompile");
+    assert!(output.contains("public class TestJava9StringConcat"));
+    assert!(output.contains("return \"\" + arg0;"));
+    assert!(output.contains("return \"\" + arg0 + arg1;"));
+    assert!(!output.contains("makeConcatWithConstants"));
+    assert_no_unresolved_artifacts(&output);
+}
+
+#[test]
+fn decompiles_vineflower_java11_string_concat_fixture() {
+    let class_path = compile_vineflower_source("testData/src/java11/pkg/TestJava11StringConcat.java");
+    let output = rustyflower::decompile_path(&class_path).expect("fixture should decompile");
+    assert!(output.contains("public class TestJava11StringConcat"));
+    assert!(output.contains("return \"\" + arg0;"));
+    assert!(output.contains("return \"\" + arg0 + arg1;"));
+    assert!(!output.contains("makeConcatWithConstants"));
+    assert_no_unresolved_artifacts(&output);
+}
+
+#[test]
+fn decompiles_vineflower_array_foreach_fixture() {
+    let class_path = compile_vineflower_source("testData/src/java8/pkg/TestArrayForeach.java");
+    let output = rustyflower::decompile_path(&class_path).expect("fixture should decompile");
+    assert!(output.contains("public class TestArrayForeach"));
+    assert!(output.contains("for (int var5 : var1)"));
+    assert!(!output.contains("iterator()"));
+    assert_no_unresolved_artifacts(&output);
+}
+
+#[test]
+fn decompiles_vineflower_while_foreach_fixture() {
+    let class_path = compile_vineflower_source("testData/src/java8/pkg/TestWhileForeach.java");
+    let output = rustyflower::decompile_path(&class_path).expect("fixture should decompile");
+    assert!(output.contains("public class TestWhileForeach"));
+    assert!(output.contains("for (java.lang.Object var4 : this.objects)"));
+    assert!(!output.contains("unsupported goto"));
+    assert_no_unresolved_artifacts(&output);
+}
+
+#[test]
+fn decompiles_vineflower_foreach_multiple_loops_fixture() {
+    let class_path = compile_vineflower_source("testData/src/java8/pkg/TestForeachMultipleLoops.java");
+    let output = rustyflower::decompile_path(&class_path).expect("fixture should decompile");
+    assert!(output.contains("public class TestForeachMultipleLoops"));
+    assert!(output.matches("for (").count() >= 2);
+    assert!(output.contains("for (java.util.Map.Entry"));
+    assert!(output.contains("for (java.lang.String var9 : arg1.values())"));
+    assert!(!output.contains("iterator()"));
+    assert_no_unresolved_artifacts(&output);
 }

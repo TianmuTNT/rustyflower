@@ -4,7 +4,7 @@ use crate::bytecode::{
 };
 use crate::cfg::BasicBlock;
 use crate::error::{DecompileError, Result};
-use crate::loader::{LoadedClass, LoadedMethod};
+use crate::loader::{LoadedBootstrapArgument, LoadedClass, LoadedMethod};
 use rust_asm::insn::{FieldInsnNode, Insn, LdcValue};
 use rust_asm::opcodes;
 use rust_asm::types::Type;
@@ -16,6 +16,9 @@ pub enum StructuredExpr {
     Temp(u32),
     CaughtException(Option<Type>),
     Literal(Literal),
+    StringConcat {
+        parts: Vec<StringConcatPart>,
+    },
     Field {
         target: Option<Box<StructuredExpr>>,
         owner: String,
@@ -74,6 +77,12 @@ pub enum Literal {
     Double(f64),
     String(String),
     Class(Type),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum StringConcatPart {
+    Literal(String),
+    Expr(StructuredExpr),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -418,13 +427,13 @@ fn translate_simple_instruction(translator: &mut BlockTranslator<'_>, opcode: u8
         | opcodes::CALOAD
         | opcodes::SALOAD => {
             let index = translator.pop_expr()?.0;
-            let array = translator.pop_expr()?.0;
+            let (array, array_ty) = translator.pop_expr()?;
             translator.push_expr(
                 StructuredExpr::ArrayAccess {
                     array: Box::new(array),
                     index: Box::new(index),
                 },
-                None,
+                infer_array_element_type(opcode, array_ty.as_ref()),
             );
             Ok(())
         }
@@ -735,6 +744,16 @@ fn translate_field_instruction(
 }
 
 fn translate_method_instruction(translator: &mut BlockTranslator<'_>, insn: &Insn) -> Result<()> {
+    if let Insn::InvokeDynamic(node) = insn
+        && let Some(expr) = try_translate_string_concat(translator, node)?
+    {
+        translator.push_expr(
+            expr,
+            Some(Type::Object("java/lang/String".to_string())),
+        );
+        return Ok(());
+    }
+
     let resolved = resolve_method_ref(&translator.class.constant_pool, insn)?;
     let mut args = Vec::with_capacity(resolved.parsed_descriptor.params.len());
     for _ in 0..resolved.parsed_descriptor.params.len() {
@@ -823,6 +842,101 @@ fn translate_constructor_call(
             }));
             Ok(())
         }
+    }
+}
+
+fn try_translate_string_concat(
+    translator: &mut BlockTranslator<'_>,
+    node: &rust_asm::insn::InvokeDynamicInsnNode,
+) -> Result<Option<StructuredExpr>> {
+    let bootstrap = match bootstrap_method_for_callsite(translator.class, node.method_index) {
+        Some(method) => method,
+        None => return Ok(None),
+    };
+    if bootstrap.owner != "java/lang/invoke/StringConcatFactory"
+        || bootstrap.name != "makeConcatWithConstants"
+    {
+        return Ok(None);
+    }
+
+    let resolved = resolve_method_ref(&translator.class.constant_pool, &Insn::InvokeDynamic(node.clone()))?;
+    let mut args = Vec::with_capacity(resolved.parsed_descriptor.params.len());
+    for _ in 0..resolved.parsed_descriptor.params.len() {
+        args.push(translator.pop_expr()?.0);
+    }
+    args.reverse();
+
+    let recipe = bootstrap
+        .arguments
+        .first()
+        .and_then(|argument| match argument {
+            LoadedBootstrapArgument::String(value) => Some(value.as_str()),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            DecompileError::Unsupported("string concat recipe is missing".to_string())
+        })?;
+
+    let mut parts = Vec::new();
+    let mut literal = String::new();
+    let mut arg_index = 0usize;
+    let mut constant_index = 1usize;
+    for ch in recipe.chars() {
+        match ch {
+            '\u{0001}' => {
+                if !literal.is_empty() {
+                    parts.push(StringConcatPart::Literal(std::mem::take(&mut literal)));
+                }
+                let expr = args.get(arg_index).cloned().ok_or_else(|| {
+                    DecompileError::Unsupported("string concat argument mismatch".to_string())
+                })?;
+                parts.push(StringConcatPart::Expr(expr));
+                arg_index += 1;
+            }
+            '\u{0002}' => {
+                if !literal.is_empty() {
+                    parts.push(StringConcatPart::Literal(std::mem::take(&mut literal)));
+                }
+                let argument = bootstrap.arguments.get(constant_index).ok_or_else(|| {
+                    DecompileError::Unsupported("string concat constant mismatch".to_string())
+                })?;
+                parts.push(StringConcatPart::Literal(render_bootstrap_literal(argument)));
+                constant_index += 1;
+            }
+            other => literal.push(other),
+        }
+    }
+    if !literal.is_empty() {
+        parts.push(StringConcatPart::Literal(literal));
+    }
+
+    Ok(Some(StructuredExpr::StringConcat { parts }))
+}
+
+fn bootstrap_method_for_callsite<'a>(
+    class: &'a LoadedClass,
+    invoke_dynamic_index: u16,
+) -> Option<&'a crate::loader::LoadedBootstrapMethod> {
+    let bootstrap_index = match class.constant_pool.get(invoke_dynamic_index as usize) {
+        Some(rust_asm::constant_pool::CpInfo::InvokeDynamic {
+            bootstrap_method_attr_index,
+            ..
+        }) => *bootstrap_method_attr_index as usize,
+        _ => return None,
+    };
+    class.bootstrap_methods.get(bootstrap_index)
+}
+
+fn render_bootstrap_literal(argument: &LoadedBootstrapArgument) -> String {
+    match argument {
+        LoadedBootstrapArgument::String(value) => value.clone(),
+        LoadedBootstrapArgument::Int(value) => value.to_string(),
+        LoadedBootstrapArgument::Float(value) => value.to_string(),
+        LoadedBootstrapArgument::Long(value) => value.to_string(),
+        LoadedBootstrapArgument::Double(value) => value.to_string(),
+        LoadedBootstrapArgument::Class(ty) => ty.get_descriptor(),
+        LoadedBootstrapArgument::MethodType(value) => value.clone(),
+        LoadedBootstrapArgument::Unknown(index) => format!("/*bootstrap:{index}*/"),
     }
 }
 
@@ -937,6 +1051,23 @@ fn push_var(translator: &mut BlockTranslator<'_>, slot: u16, opcode: u8) -> Resu
         .or_else(|| load_opcode_type(opcode));
     translator.push_expr(expr, ty);
     Ok(())
+}
+
+fn infer_array_element_type(opcode: u8, array_ty: Option<&Type>) -> Option<Type> {
+    match opcode {
+        opcodes::IALOAD => Some(Type::Int),
+        opcodes::LALOAD => Some(Type::Long),
+        opcodes::FALOAD => Some(Type::Float),
+        opcodes::DALOAD => Some(Type::Double),
+        opcodes::BALOAD => Some(Type::Byte),
+        opcodes::CALOAD => Some(Type::Char),
+        opcodes::SALOAD => Some(Type::Short),
+        opcodes::AALOAD => match array_ty {
+            Some(Type::Array(element)) => Some((**element).clone()),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn store_local(translator: &mut BlockTranslator<'_>, slot: u16) -> Result<()> {
@@ -1134,6 +1265,7 @@ fn is_safe_to_duplicate(expr: &StructuredExpr) -> bool {
             | StructuredExpr::Temp(_)
             | StructuredExpr::CaughtException(_)
             | StructuredExpr::Literal(_)
+            | StructuredExpr::StringConcat { .. }
     )
 }
 

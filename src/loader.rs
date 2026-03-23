@@ -4,7 +4,7 @@ use crate::types::{
     simple_name,
 };
 use rust_asm::class_reader::{
-    AttributeInfo, ExceptionTableEntry, LineNumber, LocalVariable, MethodParameter,
+    AttributeInfo, BootstrapMethod, ExceptionTableEntry, LocalVariable, MethodParameter,
 };
 use rust_asm::constant_pool::CpInfo;
 use rust_asm::insn::{AbstractInsnNode, Insn, TryCatchBlockNode};
@@ -21,6 +21,7 @@ pub struct LoadedClass {
     pub interfaces: Vec<String>,
     pub source_file: Option<String>,
     pub constant_pool: Vec<CpInfo>,
+    pub bootstrap_methods: Vec<LoadedBootstrapMethod>,
     pub fields: Vec<LoadedField>,
     pub methods: Vec<LoadedMethod>,
 }
@@ -87,6 +88,26 @@ pub struct LoadedParameter {
     pub descriptor: Type,
 }
 
+#[derive(Debug, Clone)]
+pub struct LoadedBootstrapMethod {
+    pub owner: String,
+    pub name: String,
+    pub descriptor: String,
+    pub arguments: Vec<LoadedBootstrapArgument>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum LoadedBootstrapArgument {
+    String(String),
+    Class(Type),
+    Int(i32),
+    Float(f32),
+    Long(i64),
+    Double(f64),
+    MethodType(String),
+    Unknown(u16),
+}
+
 impl LoadedMethod {
     pub fn is_static(&self) -> bool {
         self.access_flags & rust_asm::constants::ACC_STATIC != 0
@@ -114,7 +135,8 @@ impl LoadedMethod {
         if let Some(local) = self
             .local_variables
             .iter()
-            .find(|local| local.index == slot && local.start_pc == 0)
+            .filter(|local| local.index == slot)
+            .min_by_key(|local| local.start_pc)
         {
             return local.name.clone();
         }
@@ -134,7 +156,8 @@ impl LoadedMethod {
         }
         self.local_variables
             .iter()
-            .find(|local| local.index == slot && local.start_pc == 0)
+            .filter(|local| local.index == slot)
+            .min_by_key(|local| local.start_pc)
             .and_then(|local| parse_field_descriptor(&local.descriptor).ok())
     }
 }
@@ -162,6 +185,22 @@ pub fn load_class(node: ClassNode) -> Result<LoadedClass> {
         methods.push(load_method(&node.constant_pool, method)?);
     }
 
+    let bootstrap_methods = node
+        .attributes
+        .iter()
+        .find_map(|attr| match attr {
+            AttributeInfo::BootstrapMethods { methods } => Some(methods),
+            _ => None,
+        })
+        .map(|methods| {
+            methods
+                .iter()
+                .map(|method| decode_bootstrap_method(&node.constant_pool, method))
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+
     Ok(LoadedClass {
         access_flags: node.access_flags,
         internal_name: class_name.clone(),
@@ -171,6 +210,7 @@ pub fn load_class(node: ClassNode) -> Result<LoadedClass> {
         interfaces: node.interfaces,
         source_file: node.source_file,
         constant_pool: node.constant_pool,
+        bootstrap_methods,
         fields,
         methods,
     })
@@ -256,6 +296,90 @@ fn decode_parameter_name(cp: &[CpInfo], parameter: &MethodParameter) -> Option<S
         None
     } else {
         cp_utf8(cp, parameter.name_index).ok().map(str::to_string)
+    }
+}
+
+fn decode_bootstrap_method(cp: &[CpInfo], method: &BootstrapMethod) -> Result<LoadedBootstrapMethod> {
+    let (owner, name, descriptor) = decode_method_handle(cp, method.bootstrap_method_ref)?;
+    let arguments = method
+        .bootstrap_arguments
+        .iter()
+        .map(|index| decode_bootstrap_argument(cp, *index))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(LoadedBootstrapMethod {
+        owner,
+        name,
+        descriptor,
+        arguments,
+    })
+}
+
+fn decode_method_handle(cp: &[CpInfo], index: u16) -> Result<(String, String, String)> {
+    let reference_index = match cp.get(index as usize) {
+        Some(CpInfo::MethodHandle { reference_index, .. }) => *reference_index,
+        _ => {
+            return Err(DecompileError::InvalidClass(format!(
+                "invalid method handle index {index}"
+            )));
+        }
+    };
+    match cp.get(reference_index as usize) {
+        Some(CpInfo::Methodref {
+            class_index,
+            name_and_type_index,
+        })
+        | Some(CpInfo::InterfaceMethodref {
+            class_index,
+            name_and_type_index,
+        }) => {
+            let owner = cp_class_name(cp, *class_index)?.to_string();
+            let (name, descriptor) = cp_name_and_type(cp, *name_and_type_index)?;
+            Ok((owner, name.to_string(), descriptor.to_string()))
+        }
+        _ => Err(DecompileError::InvalidClass(format!(
+            "invalid method-handle target {reference_index}"
+        ))),
+    }
+}
+
+fn decode_bootstrap_argument(cp: &[CpInfo], index: u16) -> Result<LoadedBootstrapArgument> {
+    Ok(match cp.get(index as usize) {
+        Some(CpInfo::String { string_index }) => {
+            LoadedBootstrapArgument::String(cp_utf8(cp, *string_index)?.to_string())
+        }
+        Some(CpInfo::Utf8(value)) => LoadedBootstrapArgument::String(value.clone()),
+        Some(CpInfo::Integer(value)) => LoadedBootstrapArgument::Int(*value),
+        Some(CpInfo::Float(value)) => LoadedBootstrapArgument::Float(*value),
+        Some(CpInfo::Long(value)) => LoadedBootstrapArgument::Long(*value),
+        Some(CpInfo::Double(value)) => LoadedBootstrapArgument::Double(*value),
+        Some(CpInfo::Class { name_index }) => {
+            LoadedBootstrapArgument::Class(Type::get_object_type(cp_utf8(cp, *name_index)?))
+        }
+        Some(CpInfo::MethodType { descriptor_index }) => {
+            LoadedBootstrapArgument::MethodType(cp_utf8(cp, *descriptor_index)?.to_string())
+        }
+        Some(_) | None => LoadedBootstrapArgument::Unknown(index),
+    })
+}
+
+fn cp_name_and_type(cp: &[CpInfo], index: u16) -> Result<(&str, &str)> {
+    match cp.get(index as usize) {
+        Some(CpInfo::NameAndType {
+            name_index,
+            descriptor_index,
+        }) => Ok((cp_utf8(cp, *name_index)?, cp_utf8(cp, *descriptor_index)?)),
+        _ => Err(DecompileError::InvalidClass(format!(
+            "invalid name_and_type index {index}"
+        ))),
+    }
+}
+
+fn cp_class_name(cp: &[CpInfo], index: u16) -> Result<&str> {
+    match cp.get(index as usize) {
+        Some(CpInfo::Class { name_index }) => cp_utf8(cp, *name_index),
+        _ => Err(DecompileError::InvalidClass(format!(
+            "invalid class index {index}"
+        ))),
     }
 }
 

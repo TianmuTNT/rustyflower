@@ -4,6 +4,7 @@ use crate::expr::{
     BlockSemantics, Stmt, StructuredExpr, Terminator, negate_condition, translate_block,
 };
 use crate::loader::{LoadedClass, LoadedMethod};
+use rust_asm::types::Type;
 use std::collections::{HashSet, VecDeque};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -30,6 +31,12 @@ pub enum StructuredStmt {
     },
     While {
         condition: StructuredExpr,
+        body: Box<StructuredStmt>,
+    },
+    ForEach {
+        var_type: Type,
+        var_name: String,
+        iterable: StructuredExpr,
         body: Box<StructuredStmt>,
     },
     Comment(String),
@@ -1188,6 +1195,17 @@ fn rewrite_synchronized_stmt(stmt: StructuredStmt) -> StructuredStmt {
             condition,
             body: Box::new(rewrite_synchronized_stmt(*body)),
         },
+        StructuredStmt::ForEach {
+            var_type,
+            var_name,
+            iterable,
+            body,
+        } => StructuredStmt::ForEach {
+            var_type,
+            var_name,
+            iterable,
+            body: Box::new(rewrite_synchronized_stmt(*body)),
+        },
         other => other,
     }
 }
@@ -1641,6 +1659,41 @@ fn stmt_equivalent(
                 reverse_temp_map,
             )
         }
+        (
+            StructuredStmt::ForEach {
+                var_type: left_ty,
+                var_name: left_name,
+                iterable: left_iterable,
+                body: left_body,
+            },
+            StructuredStmt::ForEach {
+                var_type: right_ty,
+                var_name: right_name,
+                iterable: right_iterable,
+                body: right_body,
+            },
+        ) => {
+            left_ty == right_ty
+                && left_name == right_name
+                && expr_equivalent(
+                    method,
+                    left_iterable,
+                    right_iterable,
+                    slot_map,
+                    reverse_slot_map,
+                    temp_map,
+                    reverse_temp_map,
+                )
+                && stmt_equivalent(
+                    method,
+                    left_body,
+                    right_body,
+                    slot_map,
+                    reverse_slot_map,
+                    temp_map,
+                    reverse_temp_map,
+                )
+        }
         (StructuredStmt::Comment(left), StructuredStmt::Comment(right)) => left == right,
         _ => false,
     }
@@ -1782,6 +1835,31 @@ fn expr_equivalent(
         }
         (StructuredExpr::CaughtException(_), StructuredExpr::CaughtException(_)) => true,
         (StructuredExpr::Literal(left), StructuredExpr::Literal(right)) => left == right,
+        (
+            StructuredExpr::StringConcat { parts: left_parts },
+            StructuredExpr::StringConcat { parts: right_parts },
+        ) => {
+            left_parts.len() == right_parts.len()
+                && left_parts.iter().zip(right_parts.iter()).all(|(left, right)| match (left, right) {
+                    (
+                        crate::expr::StringConcatPart::Literal(left),
+                        crate::expr::StringConcatPart::Literal(right),
+                    ) => left == right,
+                    (
+                        crate::expr::StringConcatPart::Expr(left),
+                        crate::expr::StringConcatPart::Expr(right),
+                    ) => expr_equivalent(
+                        method,
+                        left,
+                        right,
+                        slot_map,
+                        reverse_slot_map,
+                        temp_map,
+                        reverse_temp_map,
+                    ),
+                    _ => false,
+                })
+        }
         (
             StructuredExpr::Field {
                 target: left_target,
@@ -2171,6 +2249,17 @@ fn strip_try_comments(stmt: StructuredStmt) -> StructuredStmt {
         },
         StructuredStmt::While { condition, body } => StructuredStmt::While {
             condition,
+            body: Box::new(strip_try_comments(*body)),
+        },
+        StructuredStmt::ForEach {
+            var_type,
+            var_name,
+            iterable,
+            body,
+        } => StructuredStmt::ForEach {
+            var_type,
+            var_name,
+            iterable,
             body: Box::new(strip_try_comments(*body)),
         },
         StructuredStmt::Switch { expr, arms } => StructuredStmt::Switch {
