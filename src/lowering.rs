@@ -4,6 +4,7 @@ use crate::loader::{LoadedClass, LoadedMethod, load_class};
 use crate::structure::{StructuredStmt, SwitchArm, SwitchLabel};
 use rust_asm::types::Type;
 use rust_asm::class_reader::ClassReader;
+use rust_asm::constants::ACC_ENUM;
 use rust_asm::constant_pool::CpInfo;
 use rust_asm::insn::{Insn, LdcValue};
 use rust_asm::opcodes;
@@ -634,10 +635,13 @@ fn infer_expr_type_from_prefix(
         StructuredExpr::Cast { ty, .. } => Some(ty.clone()),
         StructuredExpr::New { class_name, .. } => Some(Type::Object(class_name.clone())),
         StructuredExpr::ArrayLength(_)
+        | StructuredExpr::Ternary { .. }
         | StructuredExpr::Binary { .. }
         | StructuredExpr::Unary { .. }
         | StructuredExpr::InstanceOf { .. }
-        | StructuredExpr::CaughtException(_) => None,
+        | StructuredExpr::CaughtException(_)
+        | StructuredExpr::Lambda { .. }
+        | StructuredExpr::MethodReference { .. } => None,
     }
 }
 
@@ -656,35 +660,49 @@ fn lower_enum_switch(
     arms: Vec<SwitchArm>,
     resolver: Option<&ClassPathResolver>,
 ) -> Option<StructuredStmt> {
-    let StructuredExpr::ArrayAccess { array, index } = expr else {
-        return None;
+    let (selector_expr, _enum_owner, mapping) = match expr {
+        StructuredExpr::ArrayAccess { array, index } => {
+            let StructuredExpr::Field {
+                target: None,
+                owner: helper_owner,
+                name: switchmap_field,
+                is_static: true,
+                ..
+            } = *array
+            else {
+                return None;
+            };
+            let StructuredExpr::Call {
+                receiver: Some(selector_expr),
+                owner: enum_owner,
+                name,
+                descriptor,
+                args,
+                ..
+            } = *index
+            else {
+                return None;
+            };
+            if name != "ordinal" || descriptor != "()I" || !args.is_empty() {
+                return None;
+            }
+            let mapping =
+                detect_enum_switch_map(resolver?, &helper_owner, &switchmap_field, &enum_owner)?;
+            (*selector_expr, enum_owner, mapping)
+        }
+        StructuredExpr::Call {
+            receiver: Some(selector_expr),
+            owner: enum_owner,
+            name,
+            descriptor,
+            args,
+            ..
+        } if name == "ordinal" && descriptor == "()I" && args.is_empty() => {
+            let mapping = detect_direct_enum_switch_map(resolver?, &enum_owner)?;
+            (*selector_expr, enum_owner, mapping)
+        }
+        _ => return None,
     };
-    let StructuredExpr::Field {
-        target: None,
-        owner: helper_owner,
-        name: switchmap_field,
-        is_static: true,
-        ..
-    } = *array
-    else {
-        return None;
-    };
-    let StructuredExpr::Call {
-        receiver: Some(selector_expr),
-        owner: enum_owner,
-        name,
-        descriptor,
-        args,
-        ..
-    } = *index
-    else {
-        return None;
-    };
-    if name != "ordinal" || descriptor != "()I" || !args.is_empty() {
-        return None;
-    }
-
-    let mapping = detect_enum_switch_map(resolver?, &helper_owner, &switchmap_field, &enum_owner)?;
     let lowered_arms = arms
         .into_iter()
         .map(|arm| {
@@ -710,7 +728,7 @@ fn lower_enum_switch(
         .collect::<Vec<_>>();
 
     Some(StructuredStmt::Switch {
-        expr: *selector_expr,
+        expr: selector_expr,
         arms: lowered_arms,
     })
 }
@@ -846,6 +864,26 @@ fn detect_enum_switch_map(
             continue;
         }
         mapping.insert(case_value, second.name);
+    }
+    Some(mapping)
+}
+
+fn detect_direct_enum_switch_map(
+    resolver: &ClassPathResolver,
+    enum_owner: &str,
+) -> Option<HashMap<i32, String>> {
+    let enum_class = resolver.load_class(enum_owner)?;
+    let mut mapping = HashMap::new();
+    let mut ordinal = 0i32;
+    for field in &enum_class.fields {
+        if field.access_flags & ACC_ENUM == 0 {
+            continue;
+        }
+        mapping.insert(ordinal, field.name.clone());
+        ordinal += 1;
+    }
+    if mapping.is_empty() {
+        return None;
     }
     Some(mapping)
 }

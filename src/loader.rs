@@ -3,10 +3,14 @@ use crate::types::{
     ParsedMethodDescriptor, package_name, parse_field_descriptor, parse_method_descriptor,
     simple_name,
 };
+use rust_asm::constant_pool::CpInfo;
+use rust_asm::signature::{
+    ClassSignature, MethodSignature, SignatureType, parse_class_signature, parse_field_signature,
+    parse_method_signature,
+};
 use rust_asm::class_reader::{
     AttributeInfo, BootstrapMethod, ExceptionTableEntry, LocalVariable, MethodParameter,
 };
-use rust_asm::constant_pool::CpInfo;
 use rust_asm::insn::{AbstractInsnNode, Insn, TryCatchBlockNode};
 use rust_asm::nodes::ClassNode;
 use rust_asm::types::Type;
@@ -20,8 +24,13 @@ pub struct LoadedClass {
     pub super_name: Option<String>,
     pub interfaces: Vec<String>,
     pub source_file: Option<String>,
+    pub signature: Option<String>,
+    pub parsed_signature: Option<ClassSignature>,
     pub constant_pool: Vec<CpInfo>,
     pub bootstrap_methods: Vec<LoadedBootstrapMethod>,
+    pub inner_classes: Vec<LoadedInnerClass>,
+    pub outer_class: Option<String>,
+    pub enclosing_method: Option<LoadedEnclosingMethod>,
     pub fields: Vec<LoadedField>,
     pub methods: Vec<LoadedMethod>,
 }
@@ -31,6 +40,8 @@ pub struct LoadedField {
     pub access_flags: u16,
     pub name: String,
     pub descriptor: Type,
+    pub signature: Option<String>,
+    pub parsed_signature: Option<SignatureType>,
     pub constant_value: Option<LoadedConstant>,
 }
 
@@ -51,6 +62,8 @@ pub struct LoadedMethod {
     pub name: String,
     pub descriptor: String,
     pub parsed_descriptor: ParsedMethodDescriptor,
+    pub signature: Option<String>,
+    pub parsed_signature: Option<MethodSignature>,
     pub has_code: bool,
     pub max_stack: u16,
     pub max_locals: u16,
@@ -63,7 +76,6 @@ pub struct LoadedMethod {
     pub local_variables: Vec<LoadedLocalVariable>,
     pub parameters: Vec<LoadedParameter>,
     pub exceptions: Vec<String>,
-    pub signature: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -96,6 +108,15 @@ pub struct LoadedBootstrapMethod {
     pub arguments: Vec<LoadedBootstrapArgument>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadedMethodHandle {
+    pub reference_kind: u8,
+    pub owner: String,
+    pub name: String,
+    pub descriptor: String,
+    pub is_interface: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum LoadedBootstrapArgument {
     String(String),
@@ -105,7 +126,23 @@ pub enum LoadedBootstrapArgument {
     Long(i64),
     Double(f64),
     MethodType(String),
+    MethodHandle(LoadedMethodHandle),
     Unknown(u16),
+}
+
+#[derive(Debug, Clone)]
+pub struct LoadedInnerClass {
+    pub name: String,
+    pub outer_name: Option<String>,
+    pub inner_name: Option<String>,
+    pub access_flags: u16,
+}
+
+#[derive(Debug, Clone)]
+pub struct LoadedEnclosingMethod {
+    pub owner: String,
+    pub name: Option<String>,
+    pub descriptor: Option<String>,
 }
 
 impl LoadedMethod {
@@ -164,8 +201,22 @@ impl LoadedMethod {
 
 pub fn load_class(node: ClassNode) -> Result<LoadedClass> {
     let class_name = node.name.clone();
+    let class_signature = node.attributes.iter().find_map(|attr| match attr {
+        AttributeInfo::Signature { signature_index } => {
+            cp_utf8(&node.constant_pool, *signature_index).ok().map(str::to_string)
+        }
+        _ => None,
+    });
     let mut fields = Vec::with_capacity(node.fields.len());
     for field in node.fields {
+        let field_signature = field.attributes.iter().find_map(|attr| match attr {
+            AttributeInfo::Signature { signature_index } => {
+                cp_utf8(&node.constant_pool, *signature_index)
+                    .ok()
+                    .map(str::to_string)
+            }
+            _ => None,
+        });
         let constant_value = field.attributes.iter().find_map(|attr| match attr {
             AttributeInfo::ConstantValue {
                 constantvalue_index,
@@ -176,6 +227,13 @@ pub fn load_class(node: ClassNode) -> Result<LoadedClass> {
             access_flags: field.access_flags,
             name: field.name,
             descriptor: parse_field_descriptor(&field.descriptor)?,
+            parsed_signature: field_signature
+                .as_deref()
+                .map(parse_field_signature)
+                .transpose()
+                .ok()
+                .flatten(),
+            signature: field_signature,
             constant_value,
         });
     }
@@ -201,6 +259,30 @@ pub fn load_class(node: ClassNode) -> Result<LoadedClass> {
         .transpose()?
         .unwrap_or_default();
 
+    let inner_classes = node
+        .inner_classes
+        .into_iter()
+        .map(|entry| LoadedInnerClass {
+            name: entry.name,
+            outer_name: entry.outer_name,
+            inner_name: entry.inner_name,
+            access_flags: entry.access_flags,
+        })
+        .collect::<Vec<_>>();
+
+    let enclosing_method = node
+        .attributes
+        .iter()
+        .find_map(|attr| match attr {
+            AttributeInfo::EnclosingMethod {
+                class_index,
+                method_index,
+            } => Some((*class_index, *method_index)),
+            _ => None,
+        })
+        .map(|(class_index, method_index)| decode_enclosing_method(&node.constant_pool, class_index, method_index))
+        .transpose()?;
+
     Ok(LoadedClass {
         access_flags: node.access_flags,
         internal_name: class_name.clone(),
@@ -209,8 +291,22 @@ pub fn load_class(node: ClassNode) -> Result<LoadedClass> {
         super_name: node.super_name,
         interfaces: node.interfaces,
         source_file: node.source_file,
+        signature: class_signature.clone(),
+        parsed_signature: class_signature
+            .as_deref()
+            .map(parse_class_signature)
+            .transpose()
+            .ok()
+            .flatten(),
         constant_pool: node.constant_pool,
         bootstrap_methods,
+        inner_classes,
+        outer_class: if node.outer_class.is_empty() {
+            None
+        } else {
+            Some(node.outer_class)
+        },
+        enclosing_method,
         fields,
         methods,
     })
@@ -218,6 +314,13 @@ pub fn load_class(node: ClassNode) -> Result<LoadedClass> {
 
 fn load_method(cp: &[CpInfo], method: rust_asm::nodes::MethodNode) -> Result<LoadedMethod> {
     let parsed_descriptor = parse_method_descriptor(&method.descriptor)?;
+    let parsed_signature = method
+        .signature
+        .as_deref()
+        .map(parse_method_signature)
+        .transpose()
+        .ok()
+        .flatten();
     let mut parameters = Vec::with_capacity(parsed_descriptor.params.len());
     let mut slot = if method.access_flags & rust_asm::constants::ACC_STATIC != 0 {
         0
@@ -265,6 +368,8 @@ fn load_method(cp: &[CpInfo], method: rust_asm::nodes::MethodNode) -> Result<Loa
         name: method.name,
         descriptor: method.descriptor,
         parsed_descriptor,
+        signature: method.signature,
+        parsed_signature,
         has_code: method.has_code,
         max_stack: method.max_stack,
         max_locals: method.max_locals,
@@ -277,7 +382,6 @@ fn load_method(cp: &[CpInfo], method: rust_asm::nodes::MethodNode) -> Result<Loa
         local_variables,
         parameters,
         exceptions: method.exceptions,
-        signature: method.signature,
     })
 }
 
@@ -358,7 +462,39 @@ fn decode_bootstrap_argument(cp: &[CpInfo], index: u16) -> Result<LoadedBootstra
         Some(CpInfo::MethodType { descriptor_index }) => {
             LoadedBootstrapArgument::MethodType(cp_utf8(cp, *descriptor_index)?.to_string())
         }
+        Some(CpInfo::MethodHandle {
+            reference_kind,
+            reference_index,
+        }) => {
+            let (owner, name, descriptor, is_interface) = cp_method_ref(cp, *reference_index)?;
+            LoadedBootstrapArgument::MethodHandle(LoadedMethodHandle {
+                reference_kind: *reference_kind,
+                owner: owner.to_string(),
+                name: name.to_string(),
+                descriptor: descriptor.to_string(),
+                is_interface,
+            })
+        }
         Some(_) | None => LoadedBootstrapArgument::Unknown(index),
+    })
+}
+
+fn decode_enclosing_method(
+    cp: &[CpInfo],
+    class_index: u16,
+    method_index: u16,
+) -> Result<LoadedEnclosingMethod> {
+    let owner = cp_class_name(cp, class_index)?.to_string();
+    let (name, descriptor) = if method_index == 0 {
+        (None, None)
+    } else {
+        let (name, descriptor) = cp_name_and_type(cp, method_index)?;
+        (Some(name.to_string()), Some(descriptor.to_string()))
+    };
+    Ok(LoadedEnclosingMethod {
+        owner,
+        name,
+        descriptor,
     })
 }
 
@@ -370,6 +506,30 @@ fn cp_name_and_type(cp: &[CpInfo], index: u16) -> Result<(&str, &str)> {
         }) => Ok((cp_utf8(cp, *name_index)?, cp_utf8(cp, *descriptor_index)?)),
         _ => Err(DecompileError::InvalidClass(format!(
             "invalid name_and_type index {index}"
+        ))),
+    }
+}
+
+fn cp_method_ref(cp: &[CpInfo], index: u16) -> Result<(&str, &str, &str, bool)> {
+    match cp.get(index as usize) {
+        Some(CpInfo::Methodref {
+            class_index,
+            name_and_type_index,
+        }) => {
+            let owner = cp_class_name(cp, *class_index)?;
+            let (name, descriptor) = cp_name_and_type(cp, *name_and_type_index)?;
+            Ok((owner, name, descriptor, false))
+        }
+        Some(CpInfo::InterfaceMethodref {
+            class_index,
+            name_and_type_index,
+        }) => {
+            let owner = cp_class_name(cp, *class_index)?;
+            let (name, descriptor) = cp_name_and_type(cp, *name_and_type_index)?;
+            Ok((owner, name, descriptor, true))
+        }
+        _ => Err(DecompileError::InvalidClass(format!(
+            "invalid method ref index {index}"
         ))),
     }
 }

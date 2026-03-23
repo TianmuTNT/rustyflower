@@ -91,6 +91,27 @@ fn assert_no_unresolved_artifacts(output: &str) {
     );
 }
 
+fn assert_recompiles_output(class_name: &str, output: &str) {
+    let base = std::env::temp_dir().join(format!(
+        "rustyflower_recompile_{}_{}",
+        std::process::id(),
+        class_name
+    ));
+    let _ = std::fs::remove_dir_all(&base);
+    std::fs::create_dir_all(&base).expect("temp recompile directory should be created");
+
+    let source_path = base.join(format!("{class_name}.java"));
+    std::fs::write(&source_path, output).expect("decompiled source should be written");
+
+    let status = Command::new("javac")
+        .arg("-d")
+        .arg(&base)
+        .arg(&source_path)
+        .status()
+        .expect("javac should be invocable for recompilation");
+    assert!(status.success(), "decompiled output should recompile");
+}
+
 #[test]
 fn decompiles_straight_line_method() {
     let bytes = class_with_single_method("pkg/TestStraightLine", "sum", "(II)I", true, |method| {
@@ -764,4 +785,66 @@ fn decompiles_vineflower_foreach_multiple_loops_fixture() {
     assert!(output.contains("for (java.lang.String var9 : arg1.values())"));
     assert!(!output.contains("iterator()"));
     assert_no_unresolved_artifacts(&output);
+}
+
+#[test]
+fn decompiles_vineflower_parameterized_types_fixture() {
+    let class_path = compile_vineflower_source("testData/src/java8/pkg/TestParameterizedTypes.java");
+    let output = rustyflower::decompile_path(&class_path).expect("fixture should decompile");
+    assert!(output.contains("public abstract class TestParameterizedTypes<P>"));
+    assert!(output.contains("Inner<java.lang.String> getUnspecificInner();"));
+    assert!(output.contains("TestParameterizedTypes<java.lang.Number>.Inner<java.lang.String>"));
+    assert_recompiles_output("TestParameterizedTypes", &output);
+}
+
+#[test]
+fn decompiles_vineflower_inner_class_constructor_fixture() {
+    let class_path = compile_vineflower_source("testData/src/java8/pkg/TestInnerClassConstructor.java");
+    let output = rustyflower::decompile_path(&class_path).expect("fixture should decompile");
+    assert!(output.contains("new Inner(\"text\");"));
+    assert!(output.contains("new Another(3, 4);"));
+    assert!(output.contains("class Another {"));
+    assert!(output.contains("final class Inner {"));
+    assert!(!output.contains("Inner(this,"));
+    assert!(!output.contains("Another(this,"));
+    assert_recompiles_output("TestInnerClassConstructor", &output);
+}
+
+#[test]
+fn decompiles_vineflower_local_class_fixture() {
+    let class_path = compile_vineflower_source("testData/src/java8/pkg/TestLocalClass.java");
+    let output = rustyflower::decompile_path(&class_path).expect("fixture should decompile");
+    assert!(output.contains("class Local {"));
+    assert!(output.contains("class C {"));
+    assert!(output.contains("Local var2 = new Local();"));
+    assert!(output.contains("java.util.function.Supplier var1 = () -> new C();"));
+    assert!(!output.contains("1Local"));
+    assert!(!output.contains("1C"));
+    assert!(!output.contains("lambda$"));
+    assert_recompiles_output("TestLocalClass", &output);
+}
+
+#[test]
+fn decompiles_vineflower_method_reference_fixture() {
+    let class_path = compile_vineflower_source("testData/src/java8/pkg/TestMethodReferenceSameName.java");
+    let output = rustyflower::decompile_path(&class_path).expect("fixture should decompile");
+    assert!(output.contains("((java.lang.Runnable) tmp0::foo).run();"));
+    assert!(!output.contains("java.lang.Object.run("));
+    assert!(!output.contains("lambda$"));
+    assert_recompiles_output("TestMethodReferenceSameName", &output);
+}
+
+#[test]
+fn decompiles_vineflower_class_lambda_fixture() {
+    let class_path = compile_vineflower_source("testData/src/java8/pkg/TestClassLambda.java");
+    let output = rustyflower::decompile_path(&class_path).expect("fixture should decompile");
+    assert!(output.contains("var1.forEach((arg0) -> {"));
+    assert!(output.contains("java.lang.Runnable var2 = () -> {"));
+    assert!(output.contains("pkg.TestClassLambda.reduce(java.lang.Math::max);"));
+    assert!(output.contains("pkg.TestClassLambda.function(var1::toString);"));
+    assert!(output.contains("java.util.Arrays.stream(arg0).map(java.lang.annotation.Annotation::annotationType);"));
+    assert!(!output.contains("lambda$"));
+    assert!(!output.contains("java.lang.Object.run("));
+    assert_no_unresolved_artifacts(&output);
+    assert_recompiles_output("TestClassLambda", &output);
 }

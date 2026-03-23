@@ -4,7 +4,7 @@ use crate::bytecode::{
 };
 use crate::cfg::BasicBlock;
 use crate::error::{DecompileError, Result};
-use crate::loader::{LoadedBootstrapArgument, LoadedClass, LoadedMethod};
+use crate::loader::{LoadedBootstrapArgument, LoadedClass, LoadedMethod, LoadedMethodHandle};
 use rust_asm::insn::{FieldInsnNode, Insn, LdcValue};
 use rust_asm::opcodes;
 use rust_asm::types::Type;
@@ -40,6 +40,11 @@ pub enum StructuredExpr {
         op: UnaryOp,
         expr: Box<StructuredExpr>,
     },
+    Ternary {
+        condition: Box<StructuredExpr>,
+        then_expr: Box<StructuredExpr>,
+        else_expr: Box<StructuredExpr>,
+    },
     Call {
         receiver: Option<Box<StructuredExpr>>,
         owner: String,
@@ -47,6 +52,23 @@ pub enum StructuredExpr {
         descriptor: String,
         args: Vec<StructuredExpr>,
         is_static: bool,
+    },
+    Lambda {
+        implementation_owner: String,
+        implementation_name: String,
+        implementation_descriptor: String,
+        reference_kind: u8,
+        captured_args: Vec<StructuredExpr>,
+        parameter_types: Vec<Type>,
+        interface_type: Type,
+    },
+    MethodReference {
+        receiver: Option<Box<StructuredExpr>>,
+        owner: String,
+        name: String,
+        descriptor: String,
+        is_constructor: bool,
+        interface_type: Type,
     },
     New {
         class_name: String,
@@ -753,6 +775,13 @@ fn translate_method_instruction(translator: &mut BlockTranslator<'_>, insn: &Ins
         );
         return Ok(());
     }
+    if let Insn::InvokeDynamic(node) = insn
+        && let Some(expr) = try_translate_lambda(translator, node)?
+    {
+        let resolved = resolve_method_ref(&translator.class.constant_pool, insn)?;
+        translator.push_expr(expr, Some(resolved.parsed_descriptor.return_type));
+        return Ok(());
+    }
 
     let resolved = resolve_method_ref(&translator.class.constant_pool, insn)?;
     let mut args = Vec::with_capacity(resolved.parsed_descriptor.params.len());
@@ -913,6 +942,105 @@ fn try_translate_string_concat(
     Ok(Some(StructuredExpr::StringConcat { parts }))
 }
 
+fn try_translate_lambda(
+    translator: &mut BlockTranslator<'_>,
+    node: &rust_asm::insn::InvokeDynamicInsnNode,
+) -> Result<Option<StructuredExpr>> {
+    let bootstrap = match bootstrap_method_for_callsite(translator.class, node.method_index) {
+        Some(method) => method,
+        None => return Ok(None),
+    };
+    if bootstrap.owner != "java/lang/invoke/LambdaMetafactory"
+        || (bootstrap.name != "metafactory" && bootstrap.name != "altMetafactory")
+    {
+        return Ok(None);
+    }
+
+    let resolved =
+        resolve_method_ref(&translator.class.constant_pool, &Insn::InvokeDynamic(node.clone()))?;
+    let interface_type = resolved.parsed_descriptor.return_type.clone();
+    let mut captured_args = Vec::with_capacity(resolved.parsed_descriptor.params.len());
+    for _ in 0..resolved.parsed_descriptor.params.len() {
+        captured_args.push(translator.pop_expr()?.0);
+    }
+    captured_args.reverse();
+
+    let implementation = bootstrap
+        .arguments
+        .get(1)
+        .and_then(|argument| match argument {
+            LoadedBootstrapArgument::MethodHandle(handle) => Some(handle),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            DecompileError::Unsupported("lambda bootstrap is missing implementation handle".to_string())
+        })?;
+    let parameter_types = bootstrap
+        .arguments
+        .get(2)
+        .and_then(|argument| match argument {
+            LoadedBootstrapArgument::MethodType(descriptor) => Some(descriptor.as_str()),
+            _ => None,
+        })
+        .map(parse_lambda_method_type)
+        .transpose()?
+        .unwrap_or_default();
+
+    if let Some(method_reference) =
+        try_build_method_reference(implementation, &captured_args, interface_type.clone())
+    {
+        return Ok(Some(method_reference));
+    }
+
+    Ok(Some(StructuredExpr::Lambda {
+        implementation_owner: implementation.owner.clone(),
+        implementation_name: implementation.name.clone(),
+        implementation_descriptor: implementation.descriptor.clone(),
+        reference_kind: implementation.reference_kind,
+        captured_args,
+        parameter_types,
+        interface_type,
+    }))
+}
+
+fn parse_lambda_method_type(descriptor: &str) -> Result<Vec<Type>> {
+    match Type::get_method_type(descriptor) {
+        Type::Method { argument_types, .. } => Ok(argument_types),
+        _ => Err(DecompileError::InvalidClass(format!(
+            "invalid lambda method type descriptor: {descriptor}"
+        ))),
+    }
+}
+
+fn try_build_method_reference(
+    implementation: &LoadedMethodHandle,
+    captured_args: &[StructuredExpr],
+    interface_type: Type,
+) -> Option<StructuredExpr> {
+    if implementation.name.starts_with("lambda$") {
+        return None;
+    }
+    match implementation.reference_kind {
+        5 | 7 | 9 if captured_args.len() == 1 => Some(StructuredExpr::MethodReference {
+            receiver: Some(Box::new(captured_args[0].clone())),
+            owner: implementation.owner.clone(),
+            name: implementation.name.clone(),
+            descriptor: implementation.descriptor.clone(),
+            is_constructor: implementation.name == "<init>",
+            interface_type,
+        }),
+        5 | 6 | 7 | 8 | 9 if captured_args.is_empty() => Some(StructuredExpr::MethodReference {
+            receiver: None,
+            owner: implementation.owner.clone(),
+            name: implementation.name.clone(),
+            descriptor: implementation.descriptor.clone(),
+            is_constructor: implementation.name == "<init>",
+            interface_type,
+        }),
+        _ => None,
+    }
+}
+
 fn bootstrap_method_for_callsite<'a>(
     class: &'a LoadedClass,
     invoke_dynamic_index: u16,
@@ -936,6 +1064,12 @@ fn render_bootstrap_literal(argument: &LoadedBootstrapArgument) -> String {
         LoadedBootstrapArgument::Double(value) => value.to_string(),
         LoadedBootstrapArgument::Class(ty) => ty.get_descriptor(),
         LoadedBootstrapArgument::MethodType(value) => value.clone(),
+        LoadedBootstrapArgument::MethodHandle(handle) => {
+            format!(
+                "{}::{}{}",
+                handle.owner, handle.name, handle.descriptor
+            )
+        }
         LoadedBootstrapArgument::Unknown(index) => format!("/*bootstrap:{index}*/"),
     }
 }

@@ -89,6 +89,33 @@ pub fn decompile_method(class: &LoadedClass, method: &LoadedMethod) -> Result<St
     Ok(rewrite_synchronized_stmt(root))
 }
 
+pub fn decompile_expression_fallback(
+    class: &LoadedClass,
+    method: &LoadedMethod,
+) -> Result<Option<StructuredStmt>> {
+    if !method.exception_table.is_empty() {
+        return Ok(None);
+    }
+    let normalized = crate::normalize::normalize_method(method)?;
+    let method = &normalized;
+    let cfg = build_cfg(method)?;
+    if cfg.blocks.is_empty() {
+        return Ok(Some(StructuredStmt::Sequence(Vec::new())));
+    }
+    let mut visiting = HashSet::new();
+    let Some(expr) = build_expression_from_block(
+        class,
+        method,
+        &cfg,
+        cfg.entry,
+        &method.parsed_descriptor.return_type,
+        &mut visiting,
+    ) else {
+        return Ok(None);
+    };
+    Ok(Some(StructuredStmt::Basic(vec![Stmt::Return(Some(expr))])))
+}
+
 struct Builder<'a> {
     class: &'a LoadedClass,
     method: &'a LoadedMethod,
@@ -96,6 +123,179 @@ struct Builder<'a> {
     semantics: &'a [BlockSemantics],
     visited: HashSet<usize>,
     suppressed_try_starts: HashSet<u16>,
+}
+
+fn build_expression_from_block(
+    class: &LoadedClass,
+    method: &LoadedMethod,
+    cfg: &ControlFlowGraph,
+    block_id: usize,
+    return_type: &Type,
+    visiting: &mut HashSet<usize>,
+) -> Option<StructuredExpr> {
+    if !visiting.insert(block_id) {
+        return None;
+    }
+    let block = &cfg.blocks[block_id];
+    let fallthrough = method.instruction_offsets.get(block.last_index + 1).copied();
+    let mut temp_counter = 0u32;
+    let expr = match translate_block(class, method, block, fallthrough, &mut temp_counter).ok()? {
+        BlockSemantics { stmts, terminator } if stmts.is_empty() => match terminator {
+            Terminator::Return(Some(expr)) => Some(normalize_expression(expr, return_type)),
+            Terminator::Goto(target) => {
+                if let Some(expr) = constant_block_expr(method, block, return_type)
+                    && cfg
+                        .block_by_offset(target)
+                        .is_some_and(|target_block| is_return_only_block(method, target_block))
+                {
+                    Some(expr)
+                } else {
+                    cfg.block_by_offset(target).and_then(|target_block| {
+                        build_expression_from_block(
+                            class,
+                            method,
+                            cfg,
+                            target_block.id,
+                            return_type,
+                            visiting,
+                        )
+                    })
+                }
+            }
+            Terminator::Fallthrough(Some(target)) => {
+                if let Some(expr) = constant_block_expr(method, block, return_type)
+                    && cfg
+                        .block_by_offset(target)
+                        .is_some_and(|target_block| is_return_only_block(method, target_block))
+                {
+                    Some(expr)
+                } else {
+                    None
+                }
+            }
+            Terminator::If {
+                condition,
+                jump_target,
+                fallthrough_target,
+            } => {
+                let then_expr = cfg.block_by_offset(jump_target).and_then(|target_block| {
+                    build_expression_from_block(
+                        class,
+                        method,
+                        cfg,
+                        target_block.id,
+                        return_type,
+                        visiting,
+                    )
+                })?;
+                let else_expr = cfg
+                    .block_by_offset(fallthrough_target)
+                    .and_then(|target_block| {
+                        build_expression_from_block(
+                            class,
+                            method,
+                            cfg,
+                            target_block.id,
+                            return_type,
+                            visiting,
+                        )
+                    })?;
+                Some(combine_conditional_expression(
+                    condition,
+                    then_expr,
+                    else_expr,
+                    return_type,
+                ))
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+    visiting.remove(&block_id);
+    expr
+}
+
+fn constant_block_expr(
+    method: &LoadedMethod,
+    block: &crate::cfg::BasicBlock,
+    return_type: &Type,
+) -> Option<StructuredExpr> {
+    let first = &method.instructions[block.first_index];
+    let expr = match first {
+        rust_asm::insn::Insn::Simple(node) => match node.opcode {
+            rust_asm::opcodes::ICONST_M1 => StructuredExpr::Literal(crate::expr::Literal::Int(-1)),
+            rust_asm::opcodes::ICONST_0 => StructuredExpr::Literal(crate::expr::Literal::Int(0)),
+            rust_asm::opcodes::ICONST_1 => StructuredExpr::Literal(crate::expr::Literal::Int(1)),
+            rust_asm::opcodes::ICONST_2 => StructuredExpr::Literal(crate::expr::Literal::Int(2)),
+            rust_asm::opcodes::ICONST_3 => StructuredExpr::Literal(crate::expr::Literal::Int(3)),
+            rust_asm::opcodes::ICONST_4 => StructuredExpr::Literal(crate::expr::Literal::Int(4)),
+            rust_asm::opcodes::ICONST_5 => StructuredExpr::Literal(crate::expr::Literal::Int(5)),
+            _ => return None,
+        },
+        _ => return None,
+    };
+    Some(normalize_expression(expr, return_type))
+}
+
+fn is_return_only_block(method: &LoadedMethod, block: &crate::cfg::BasicBlock) -> bool {
+    block.first_index == block.last_index
+        && matches!(
+            method.instructions[block.first_index],
+            rust_asm::insn::Insn::Simple(ref node)
+                if matches!(
+                    node.opcode,
+                    rust_asm::opcodes::IRETURN
+                        | rust_asm::opcodes::ARETURN
+                        | rust_asm::opcodes::LRETURN
+                        | rust_asm::opcodes::FRETURN
+                        | rust_asm::opcodes::DRETURN
+                )
+        )
+}
+
+fn combine_conditional_expression(
+    condition: StructuredExpr,
+    then_expr: StructuredExpr,
+    else_expr: StructuredExpr,
+    return_type: &Type,
+) -> StructuredExpr {
+    let then_expr = normalize_expression(then_expr, return_type);
+    let else_expr = normalize_expression(else_expr, return_type);
+    if is_boolean_true(&then_expr) && is_boolean_false(&else_expr) {
+        condition
+    } else if is_boolean_false(&then_expr) && is_boolean_true(&else_expr) {
+        negate_condition(condition)
+    } else {
+        StructuredExpr::Ternary {
+            condition: Box::new(condition),
+            then_expr: Box::new(then_expr),
+            else_expr: Box::new(else_expr),
+        }
+    }
+}
+
+fn normalize_expression(expr: StructuredExpr, return_type: &Type) -> StructuredExpr {
+    if matches!(return_type, Type::Boolean) {
+        match expr {
+            StructuredExpr::Literal(crate::expr::Literal::Int(0)) => {
+                StructuredExpr::Literal(crate::expr::Literal::Boolean(false))
+            }
+            StructuredExpr::Literal(crate::expr::Literal::Int(1)) => {
+                StructuredExpr::Literal(crate::expr::Literal::Boolean(true))
+            }
+            other => other,
+        }
+    } else {
+        expr
+    }
+}
+
+fn is_boolean_true(expr: &StructuredExpr) -> bool {
+    matches!(expr, StructuredExpr::Literal(crate::expr::Literal::Boolean(true)))
+}
+
+fn is_boolean_false(expr: &StructuredExpr) -> bool {
+    matches!(expr, StructuredExpr::Literal(crate::expr::Literal::Boolean(false)))
 }
 
 #[derive(Debug, Clone)]

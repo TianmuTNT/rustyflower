@@ -1,4 +1,5 @@
 use crate::error::{DecompileError, Result};
+use rust_asm::signature::{ClassTypeSignature, SignatureType, TypeArgument};
 use rust_asm::types::Type;
 
 #[derive(Debug, Clone)]
@@ -46,6 +47,60 @@ pub fn format_type(ty: &Type) -> String {
         Type::Array(element) => format!("{}[]", format_type(element)),
         Type::Object(name) => format_internal_name(name),
         Type::Method { .. } => "<method>".to_string(),
+    }
+}
+
+pub fn format_signature_type(ty: &SignatureType) -> String {
+    match ty {
+        SignatureType::Base(ty) => format_type(ty),
+        SignatureType::TypeVariable(name) => name.clone(),
+        SignatureType::Array(element) => format!("{}[]", format_signature_type(element)),
+        SignatureType::Class(class) => format_class_type_signature(class),
+    }
+}
+
+pub fn format_class_type_signature(class: &ClassTypeSignature) -> String {
+    let mut rendered = String::new();
+    if !class.package_specifier.is_empty() {
+        rendered.push_str(&class.package_specifier.join("."));
+        rendered.push('.');
+    }
+    rendered.push_str(&format_simple_class_signature(
+        &class.simple_class.name,
+        &class.simple_class.type_arguments,
+    ));
+    for suffix in &class.suffixes {
+        rendered.push('.');
+        rendered.push_str(&format_simple_class_signature(
+            &suffix.name,
+            &suffix.type_arguments,
+        ));
+    }
+    rendered
+}
+
+fn format_simple_class_signature(name: &str, type_arguments: &[TypeArgument]) -> String {
+    let mut rendered = name.to_string();
+    if !type_arguments.is_empty() {
+        rendered.push('<');
+        rendered.push_str(
+            &type_arguments
+                .iter()
+                .map(format_type_argument)
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        rendered.push('>');
+    }
+    rendered
+}
+
+fn format_type_argument(argument: &TypeArgument) -> String {
+    match argument {
+        TypeArgument::Any => "?".to_string(),
+        TypeArgument::Exact(ty) => format_signature_type(ty),
+        TypeArgument::Extends(ty) => format!("? extends {}", format_signature_type(ty)),
+        TypeArgument::Super(ty) => format!("? super {}", format_signature_type(ty)),
     }
 }
 
