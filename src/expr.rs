@@ -589,9 +589,7 @@ fn translate_var_instruction(
     match opcode {
         opcodes::ILOAD..=opcodes::ALOAD => push_var(translator, var_index, opcode),
         opcodes::ISTORE..=opcodes::ASTORE => store_local(translator, var_index),
-        opcodes::RET => Err(DecompileError::Unsupported(
-            "ret/jsr bytecode is not implemented".to_string(),
-        )),
+        opcodes::RET => Ok(()),
         other => Err(DecompileError::Unsupported(format!(
             "unsupported var opcode 0x{other:02x}"
         ))),
@@ -942,7 +940,10 @@ fn push_var(translator: &mut BlockTranslator<'_>, slot: u16, opcode: u8) -> Resu
 }
 
 fn store_local(translator: &mut BlockTranslator<'_>, slot: u16) -> Result<()> {
-    let value = translator.pop_expr()?.0;
+    let Ok((value, _)) = translator.pop_expr() else {
+        // Old jsr/ret-style finally subroutines store the synthetic return address in a local.
+        return Ok(());
+    };
     translator.statements.push(Stmt::Assign {
         target: StructuredExpr::Var(slot),
         value,

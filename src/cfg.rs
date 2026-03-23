@@ -142,6 +142,15 @@ pub fn build_cfg(method: &LoadedMethod) -> Result<ControlFlowGraph> {
                     jump_target(last_offset, node.offset)?,
                 )?);
             }
+            Insn::Jump(node) if matches!(node.insn.opcode, opcodes::JSR | opcodes::JSR_W) => {
+                successors.push(block_id_for_offset(
+                    &offset_to_block,
+                    jump_target(last_offset, node.offset)?,
+                )?);
+                if let Some(next_offset) = method.instruction_offsets.get(last_index + 1) {
+                    successors.push(block_id_for_offset(&offset_to_block, *next_offset)?);
+                }
+            }
             Insn::Jump(node) if is_conditional_jump(node.insn.opcode) => {
                 successors.push(block_id_for_offset(
                     &offset_to_block,

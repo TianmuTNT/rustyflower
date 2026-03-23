@@ -4,7 +4,7 @@ use crate::expr::{
     BlockSemantics, Stmt, StructuredExpr, Terminator, negate_condition, translate_block,
 };
 use crate::loader::{LoadedClass, LoadedMethod};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum StructuredStmt {
@@ -75,7 +75,7 @@ pub fn decompile_method(class: &LoadedClass, method: &LoadedMethod) -> Result<St
     let root = StructuredStmt::Sequence(builder.build_range(
         0,
         cfg.blocks.len(),
-        GotoHandling::Comment,
+        GotoHandling::comment(),
     )?);
     Ok(rewrite_synchronized_stmt(root))
 }
@@ -89,11 +89,41 @@ struct Builder<'a> {
     suppressed_try_starts: HashSet<u16>,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum GotoHandling {
-    Comment,
-    Suppress(u16),
-    Break(u16),
+#[derive(Debug, Clone)]
+struct GotoHandling {
+    suppressed: Vec<u16>,
+    break_target: Option<u16>,
+}
+
+impl GotoHandling {
+    fn comment() -> Self {
+        Self {
+            suppressed: Vec::new(),
+            break_target: None,
+        }
+    }
+
+    fn suppress(target: u16) -> Self {
+        Self {
+            suppressed: vec![target],
+            break_target: None,
+        }
+    }
+
+    fn break_to(target: u16) -> Self {
+        Self {
+            suppressed: Vec::new(),
+            break_target: Some(target),
+        }
+    }
+
+    fn with_suppressed(&self, target: u16) -> Self {
+        let mut next = self.clone();
+        if !next.suppressed.contains(&target) {
+            next.suppressed.push(target);
+        }
+        next
+    }
 }
 
 impl<'a> Builder<'a> {
@@ -113,7 +143,7 @@ impl<'a> Builder<'a> {
                 continue;
             }
             if let Some((stmt, next_pos, consumed)) =
-                self.try_build_synchronized(pos, end_pos, goto_handling)?
+                self.try_build_synchronized(pos, end_pos, goto_handling.clone())?
             {
                 self.visited.extend(consumed);
                 statements.push(stmt);
@@ -122,7 +152,7 @@ impl<'a> Builder<'a> {
             }
             if !self.suppressed_try_starts.contains(&block_start)
                 && let Some((stmt, next_pos, consumed)) =
-                    self.try_build_try_catch(pos, end_pos, goto_handling)?
+                    self.try_build_try_catch(pos, end_pos, goto_handling.clone())?
             {
                 self.visited.extend(consumed);
                 statements.push(stmt);
@@ -130,7 +160,7 @@ impl<'a> Builder<'a> {
                 continue;
             }
             if let Some((stmt, next_pos, consumed)) =
-                self.try_build_switch(pos, end_pos, goto_handling)?
+                self.try_build_switch(pos, end_pos, goto_handling.clone())?
             {
                 self.visited.extend(consumed);
                 statements.push(stmt);
@@ -138,7 +168,7 @@ impl<'a> Builder<'a> {
                 continue;
             }
             if let Some((stmt, next_pos, consumed)) =
-                self.try_build_while(pos, end_pos, goto_handling)?
+                self.try_build_while(pos, end_pos, goto_handling.clone())?
             {
                 self.visited.extend(consumed);
                 statements.push(stmt);
@@ -146,7 +176,7 @@ impl<'a> Builder<'a> {
                 continue;
             }
             if let Some((stmt, next_pos, consumed)) =
-                self.try_build_if(pos, end_pos, goto_handling)?
+                self.try_build_if(pos, end_pos, goto_handling.clone())?
             {
                 self.visited.extend(consumed);
                 statements.push(stmt);
@@ -155,7 +185,7 @@ impl<'a> Builder<'a> {
             }
 
             self.visited.insert(block_id);
-            statements.push(self.basic_statement(block_id, goto_handling));
+            statements.push(self.basic_statement(block_id, goto_handling.clone()));
             pos += 1;
         }
         Ok(statements)
@@ -166,18 +196,16 @@ impl<'a> Builder<'a> {
         match &self.semantics[block_id].terminator {
             Terminator::Return(value) => stmts.push(Stmt::Return(value.clone())),
             Terminator::Throw(value) => stmts.push(Stmt::Throw(value.clone())),
-            Terminator::Goto(target) => match goto_handling {
-                GotoHandling::Comment => stmts.push(Stmt::Comment(format!(
-                    "rustyflower: unsupported goto to offset {target}"
-                ))),
-                GotoHandling::Suppress(suppressed) if suppressed == *target => {}
-                GotoHandling::Break(merge) if merge == *target => {
+            Terminator::Goto(target) => {
+                if goto_handling.suppressed.contains(target) {
+                } else if goto_handling.break_target == Some(*target) {
                     stmts.push(Stmt::Break);
-                }
-                _ => stmts.push(Stmt::Comment(format!(
+                } else {
+                    stmts.push(Stmt::Comment(format!(
                     "rustyflower: unsupported goto to offset {target}"
-                ))),
-            },
+                )));
+                }
+            }
             Terminator::Switch { .. } => {
                 stmts.push(Stmt::Comment(
                     "rustyflower: switch reconstruction is not implemented yet".to_string(),
@@ -232,11 +260,12 @@ impl<'a> Builder<'a> {
             return Ok(None);
         }
 
+        let catch_all_end = self.catch_all_handler_end_pos(handler_pos, end_pos);
         let merge_pos = self.find_try_catch_merge_pos(
             next_pos,
             try_end_pos,
             &[],
-            Some((handler_pos, handler_pc)),
+            Some((handler_pos, catch_all_end)),
             end_pos,
         );
         let merge_offset = if merge_pos < self.cfg.order.len() {
@@ -251,35 +280,56 @@ impl<'a> Builder<'a> {
         let try_body = wrap_sequence(self.build_range(
             next_pos,
             try_end_pos,
-            match merge_offset {
-                Some(offset) => GotoHandling::Suppress(offset),
-                None => goto_handling,
-            },
+            merge_offset
+                .map(|offset| goto_handling.with_suppressed(offset))
+                .unwrap_or_else(|| goto_handling.clone()),
         )?);
         let mut try_body = strip_try_comments(try_body);
         let handler_body = wrap_sequence(self.build_range(
             handler_pos,
-            merge_pos,
-            match merge_offset {
-                Some(offset) => GotoHandling::Suppress(offset),
-                None => goto_handling,
-            },
+            catch_all_end,
+            merge_offset
+                .map(|offset| goto_handling.with_suppressed(offset))
+                .unwrap_or_else(|| goto_handling.clone()),
         )?);
         let handler_body = strip_try_comments(handler_body);
+        let (canonical_finally, _slot) = extract_finally_from_handler(handler_body)?;
+        if !is_monitor_only_finally(&canonical_finally) {
+            self.suppressed_try_starts
+                .remove(&self.cfg.blocks[self.cfg.order[handler_pos]].start_offset);
+            self.suppressed_try_starts.remove(&region_start_offset);
+            return Ok(None);
+        }
+
+        if try_end_pos < handler_pos {
+            let normal_tail = wrap_sequence(self.build_range(
+                    try_end_pos,
+                    handler_pos,
+                    merge_offset
+                        .map(|offset| goto_handling.with_suppressed(offset))
+                        .unwrap_or_else(|| goto_handling.clone()),
+                )?);
+            let normal_tail = strip_try_comments(normal_tail);
+            if let Some(stripped) =
+                remove_duplicate_finally(self.method, normal_tail, &canonical_finally)
+            {
+                if !matches!(stripped, StructuredStmt::Empty) {
+                    let mut items = top_level_items(try_body);
+                    items.extend(top_level_items(stripped));
+                    try_body = wrap_sequence(items);
+                }
+            }
+        }
+
+        let Some(sync_body) = strip_monitor_exit_suffix(try_body, &canonical_finally) else {
+            self.suppressed_try_starts
+                .remove(&self.cfg.blocks[self.cfg.order[handler_pos]].start_offset);
+            self.suppressed_try_starts.remove(&region_start_offset);
+            return Ok(None);
+        };
         self.suppressed_try_starts
             .remove(&self.cfg.blocks[self.cfg.order[handler_pos]].start_offset);
         self.suppressed_try_starts.remove(&region_start_offset);
-
-        let (canonical_finally, _slot) = extract_finally_from_handler(handler_body)?;
-        if !is_monitor_only_finally(&canonical_finally) {
-            return Ok(None);
-        }
-        let sync_body = strip_monitor_exit_suffix(try_body, &canonical_finally)
-            .ok_or_else(|| {
-                DecompileError::Unsupported(
-                    "synchronized body does not match monitor exit pattern".to_string(),
-                )
-            })?;
 
         let mut items = Vec::new();
         let mut prefix_remaining = prefix_stmts.clone();
@@ -337,6 +387,9 @@ impl<'a> Builder<'a> {
             if handler_pos < try_end_pos {
                 return Ok(None);
             }
+            if handler_pos >= end_pos {
+                continue;
+            }
             if entry.catch_type == 0 {
                 catch_all_handler = Some((handler_pos, entry.handler_pc));
             } else {
@@ -349,31 +402,38 @@ impl<'a> Builder<'a> {
         }
         typed_handlers.sort_by_key(|(handler_pos, _)| *handler_pos);
         typed_handlers.dedup_by_key(|(handler_pos, _)| *handler_pos);
+        if typed_handlers.is_empty() && catch_all_handler.is_none() {
+            return Ok(None);
+        }
 
-        let merge_pos =
-            self.find_try_catch_merge_pos(pos, try_end_pos, &typed_handlers, catch_all_handler, end_pos);
+        let catch_all_end = catch_all_handler
+            .map(|(handler_pos, _)| self.catch_all_handler_end_pos(handler_pos, end_pos));
+        let merge_pos = self.find_try_catch_merge_pos(
+            pos,
+            try_end_pos,
+            &typed_handlers,
+            catch_all_handler.map(|(handler_pos, _)| (handler_pos, catch_all_end.unwrap_or(handler_pos + 1))),
+            end_pos,
+        );
         let merge_offset = if merge_pos < self.cfg.order.len() {
             Some(self.cfg.blocks[self.cfg.order[merge_pos]].start_offset)
         } else {
             None
         };
-        let catch_all_end = catch_all_handler
-            .map(|(handler_pos, _)| self.catch_all_handler_end_pos(handler_pos, end_pos))
-            .unwrap_or(merge_pos);
+        let catch_all_end = catch_all_end.unwrap_or(merge_pos);
 
         self.suppressed_try_starts.insert(start_offset);
-        let mut try_body = wrap_sequence(self.build_range(
+        let try_body = wrap_sequence(self.build_range(
             pos,
             try_end_pos,
-            match merge_offset {
-                Some(offset) => GotoHandling::Suppress(offset),
-                None => goto_handling,
-            },
+            merge_offset
+                .map(|offset| goto_handling.with_suppressed(offset))
+                .unwrap_or_else(|| goto_handling.clone()),
         )?);
         let mut try_body = strip_try_comments(try_body);
 
         let mut catches = Vec::new();
-        let mut consumed = (pos..merge_pos.min(self.cfg.order.len()))
+        let consumed = (pos..merge_pos.min(self.cfg.order.len()))
             .map(|region_pos| self.cfg.order[region_pos])
             .collect::<Vec<_>>();
 
@@ -390,10 +450,9 @@ impl<'a> Builder<'a> {
             let canonical_handler_body = wrap_sequence(self.build_range(
                 catch_all_pos,
                 catch_all_end,
-                match merge_offset {
-                    Some(offset) => GotoHandling::Suppress(offset),
-                    None => goto_handling,
-                },
+                merge_offset
+                    .map(|offset| goto_handling.with_suppressed(offset))
+                    .unwrap_or_else(|| goto_handling.clone()),
             )?);
             let canonical_handler_body = strip_try_comments(canonical_handler_body);
             let (canonical_finally, catch_var_slot) =
@@ -404,15 +463,14 @@ impl<'a> Builder<'a> {
                 let normal_tail = wrap_sequence(self.build_range(
                     try_end_pos,
                     first_handler_pos,
-                    match merge_offset {
-                        Some(offset) => GotoHandling::Suppress(offset),
-                        None => goto_handling,
-                    },
+                    merge_offset
+                        .map(|offset| goto_handling.with_suppressed(offset))
+                        .unwrap_or_else(|| goto_handling.clone()),
                 )?);
                 let normal_tail = strip_try_comments(normal_tail);
-                if let Some(stripped) =
-                    remove_duplicate_finally(self.method, normal_tail.clone(), &canonical_finally)
-                {
+                let stripped_normal_tail =
+                    remove_duplicate_finally(self.method, normal_tail.clone(), &canonical_finally);
+                if let Some(stripped) = stripped_normal_tail {
                     if !matches!(stripped, StructuredStmt::Empty) {
                         let mut items = top_level_items(try_body);
                         items.extend(top_level_items(stripped));
@@ -423,6 +481,8 @@ impl<'a> Builder<'a> {
                         rendered_finally = normal_tail;
                     }
                 } else if !is_monitor_only_finally(&canonical_finally) {
+                    self.suppressed_try_starts.remove(&catch_all_start_offset);
+                    self.suppressed_try_starts.remove(&start_offset);
                     return Ok(None);
                 }
             }
@@ -436,10 +496,9 @@ impl<'a> Builder<'a> {
                 let catch_body = wrap_sequence(self.build_range(
                     *handler_pos,
                     catch_end,
-                    match merge_offset {
-                        Some(offset) => GotoHandling::Suppress(offset),
-                        None => goto_handling,
-                    },
+                    merge_offset
+                        .map(|offset| goto_handling.with_suppressed(offset))
+                        .unwrap_or_else(|| goto_handling.clone()),
                 )?);
                 let catch_body = strip_try_comments(catch_body);
                 let (catch_var, catch_body) =
@@ -488,10 +547,9 @@ impl<'a> Builder<'a> {
             let catch_body = wrap_sequence(self.build_range(
                 *handler_pos,
                 catch_end,
-                match merge_offset {
-                    Some(offset) => GotoHandling::Suppress(offset),
-                    None => goto_handling,
-                },
+                merge_offset
+                    .map(|offset| goto_handling.with_suppressed(offset))
+                    .unwrap_or_else(|| goto_handling.clone()),
             )?);
             let catch_body = strip_try_comments(catch_body);
             let (catch_var, catch_body) =
@@ -591,10 +649,9 @@ impl<'a> Builder<'a> {
             let body = wrap_sequence(self.build_range(
                 start_pos,
                 arm_end,
-                match merge_offset {
-                    Some(merge_offset) => GotoHandling::Break(merge_offset),
-                    None => goto_handling,
-                },
+                merge_offset
+                    .map(GotoHandling::break_to)
+                    .unwrap_or_else(|| goto_handling.clone()),
             )?);
             for region_pos in start_pos..arm_end {
                 consumed.push(self.cfg.order[region_pos]);
@@ -642,6 +699,59 @@ impl<'a> Builder<'a> {
     ) -> Result<Option<(StructuredStmt, usize, Vec<usize>)>> {
         let block_id = self.cfg.order[pos];
         let terminator = &self.semantics[block_id].terminator;
+        if let Terminator::Goto(condition_target) = terminator {
+            let condition_pos = self.position_for_offset(*condition_target)?;
+            let body_start_pos = pos + 1;
+            if body_start_pos >= condition_pos || condition_pos >= end_pos {
+                return Ok(None);
+            }
+
+            let condition_block_id = self.cfg.order[condition_pos];
+            let Terminator::If {
+                condition,
+                jump_target,
+                fallthrough_target,
+            } = &self.semantics[condition_block_id].terminator
+            else {
+                return Ok(None);
+            };
+
+            let body_start_offset = self.cfg.blocks[self.cfg.order[body_start_pos]].start_offset;
+            let (loop_condition, exit_pos) = if *jump_target == body_start_offset {
+                (condition.clone(), self.position_for_offset(*fallthrough_target)?)
+            } else if *fallthrough_target == body_start_offset {
+                (
+                    negate_condition(condition.clone()),
+                    self.position_for_offset(*jump_target)?,
+                )
+            } else {
+                return Ok(None);
+            };
+
+            if exit_pos <= condition_pos || exit_pos > end_pos {
+                return Ok(None);
+            }
+
+            let body_stmts = self.build_range(
+                body_start_pos,
+                condition_pos,
+                GotoHandling::suppress(*condition_target),
+            )?;
+            let while_stmt = StructuredStmt::While {
+                condition: loop_condition,
+                body: Box::new(wrap_sequence(body_stmts)),
+            };
+            let mut items = Vec::new();
+            if !self.semantics[block_id].stmts.is_empty() {
+                items.push(StructuredStmt::Basic(self.semantics[block_id].stmts.clone()));
+            }
+            items.push(while_stmt);
+            let consumed = (pos..=condition_pos)
+                .map(|region_pos| self.cfg.order[region_pos])
+                .collect::<Vec<_>>();
+            return Ok(Some((wrap_sequence(items), exit_pos, consumed)));
+        }
+
         let Terminator::If {
             condition,
             jump_target,
@@ -691,20 +801,25 @@ impl<'a> Builder<'a> {
         let body_stmts = self.build_range(
             body_start_pos,
             backedge_pos + 1,
-            GotoHandling::Suppress(loop_header_offset),
+            GotoHandling::suppress(loop_header_offset),
         )?;
         let mut consumed = vec![block_id];
         for region_pos in body_start_pos..=backedge_pos {
             consumed.push(self.cfg.order[region_pos]);
         }
-        Ok(Some((
-            StructuredStmt::While {
-                condition: loop_condition,
-                body: Box::new(wrap_sequence(body_stmts)),
-            },
-            exit_pos,
-            consumed,
-        )))
+        let while_stmt = StructuredStmt::While {
+            condition: loop_condition,
+            body: Box::new(wrap_sequence(body_stmts)),
+        };
+        let stmt = if self.semantics[block_id].stmts.is_empty() {
+            while_stmt
+        } else {
+            StructuredStmt::Sequence(vec![
+                StructuredStmt::Basic(self.semantics[block_id].stmts.clone()),
+                while_stmt,
+            ])
+        };
+        Ok(Some((stmt, exit_pos, consumed)))
     }
 
     fn try_build_if(
@@ -749,7 +864,29 @@ impl<'a> Builder<'a> {
                 return Ok(None);
             };
 
-        if split_pos <= then_start_pos || split_pos > end_pos {
+        if split_pos > end_pos {
+            let then_body = self.build_range(then_start_pos, end_pos, goto_handling)?;
+            let mut consumed = vec![block_id];
+            for region_pos in then_start_pos..end_pos {
+                consumed.push(self.cfg.order[region_pos]);
+            }
+            let if_stmt = StructuredStmt::If {
+                condition: source_condition,
+                then_branch: Box::new(wrap_sequence(then_body)),
+                else_branch: None,
+            };
+            let stmt = if self.semantics[block_id].stmts.is_empty() {
+                if_stmt
+            } else {
+                StructuredStmt::Sequence(vec![
+                    StructuredStmt::Basic(self.semantics[block_id].stmts.clone()),
+                    if_stmt,
+                ])
+            };
+            return Ok(Some((stmt, end_pos, consumed)));
+        }
+
+        if split_pos <= then_start_pos {
             return Ok(None);
         }
 
@@ -769,9 +906,9 @@ impl<'a> Builder<'a> {
                 let then_body = self.build_range(
                     then_start_pos,
                     split_pos,
-                    GotoHandling::Suppress(merge_target),
+                    GotoHandling::suppress(merge_target),
                 )?;
-                let else_body = self.build_range(split_pos, merge_pos, goto_handling)?;
+                let else_body = self.build_range(split_pos, merge_pos, goto_handling.clone())?;
                 let mut consumed = vec![block_id];
                 for region_pos in then_start_pos..merge_pos {
                     consumed.push(self.cfg.order[region_pos]);
@@ -787,15 +924,23 @@ impl<'a> Builder<'a> {
                     consumed,
                 )
             } else {
-                let then_body = self.build_range(then_start_pos, split_pos, goto_handling)?;
+                let then_body = self.build_range(then_start_pos, split_pos, goto_handling.clone())?;
                 let mut consumed = vec![block_id];
                 for region_pos in then_start_pos..split_pos {
                     consumed.push(self.cfg.order[region_pos]);
                 }
-                let stmt = StructuredStmt::If {
+                let if_stmt = StructuredStmt::If {
                     condition: source_condition,
                     then_branch: Box::new(wrap_sequence(then_body)),
                     else_branch: None,
+                };
+                let stmt = if self.semantics[block_id].stmts.is_empty() {
+                    if_stmt
+                } else {
+                    StructuredStmt::Sequence(vec![
+                        StructuredStmt::Basic(self.semantics[block_id].stmts.clone()),
+                        if_stmt,
+                    ])
                 };
                 return Ok(Some((stmt, split_pos, consumed)));
             };
@@ -804,19 +949,27 @@ impl<'a> Builder<'a> {
             self.build_range(
                 then_start_pos,
                 then_end_pos,
-                GotoHandling::Suppress(
+                GotoHandling::suppress(
                     self.cfg.blocks[self.cfg.order[next_pos_after]].start_offset,
                 ),
             )
             .unwrap_or_default()
         } else {
-            self.build_range(split_pos, next_pos_after, goto_handling)
+            self.build_range(split_pos, next_pos_after, goto_handling.clone())
                 .unwrap_or_default()
         };
-        let stmt = StructuredStmt::If {
+        let if_stmt = StructuredStmt::If {
             condition: source_condition,
             then_branch: Box::new(wrap_sequence(then_body)),
             else_branch: else_branch.map(Box::new),
+        };
+        let stmt = if self.semantics[block_id].stmts.is_empty() {
+            if_stmt
+        } else {
+            StructuredStmt::Sequence(vec![
+                StructuredStmt::Basic(self.semantics[block_id].stmts.clone()),
+                if_stmt,
+            ])
         };
         Ok(Some((stmt, next_pos_after, consumed)))
     }
@@ -898,14 +1051,14 @@ impl<'a> Builder<'a> {
         try_start_pos: usize,
         try_end_pos: usize,
         handlers: &[(usize, String)],
-        catch_all_handler: Option<(usize, u16)>,
+        catch_all_handler: Option<(usize, usize)>,
         end_pos: usize,
     ) -> usize {
         let last_handler_pos = handlers
             .iter()
             .map(|(handler_pos, _)| *handler_pos)
             .max()
-            .max(catch_all_handler.map(|(handler_pos, _)| handler_pos))
+            .max(catch_all_handler.map(|(_, handler_end_pos)| handler_end_pos.saturating_sub(1)))
             .unwrap_or(try_end_pos);
         let mut candidates = Vec::new();
 
@@ -930,19 +1083,24 @@ impl<'a> Builder<'a> {
     }
 
     fn catch_all_handler_end_pos(&self, handler_pos: usize, end_pos: usize) -> usize {
-        let mut pos = handler_pos;
-        while pos + 1 < end_pos {
-            let next = pos + 1;
-            if !matches!(
-                self.semantics[self.cfg.order[pos]].terminator,
-                Terminator::Fallthrough(Some(offset))
-                    if self.cfg.blocks[self.cfg.order[next]].start_offset == offset
-            ) {
-                break;
+        let mut max_pos = handler_pos;
+        let mut queue = VecDeque::from([handler_pos]);
+        let mut visited = HashSet::new();
+
+        while let Some(pos) = queue.pop_front() {
+            if pos >= end_pos || !visited.insert(pos) {
+                continue;
             }
-            pos = next;
+            max_pos = max_pos.max(pos);
+            let block_id = self.cfg.order[pos];
+            for successor in successor_positions(self.cfg, &self.semantics[block_id]) {
+                if successor >= handler_pos && successor < end_pos {
+                    queue.push_back(successor);
+                }
+            }
         }
-        pos + 1
+
+        max_pos + 1
     }
 }
 
@@ -1035,7 +1193,7 @@ fn rewrite_synchronized_stmt(stmt: StructuredStmt) -> StructuredStmt {
 }
 
 fn rewrite_synchronized_sequence(items: Vec<StructuredStmt>) -> StructuredStmt {
-    let mut rewritten = items
+    let rewritten = items
         .into_iter()
         .map(rewrite_synchronized_stmt)
         .flat_map(top_level_items)
@@ -1074,6 +1232,10 @@ fn try_fold_synchronized_pair(items: &[StructuredStmt]) -> Option<(StructuredStm
     }
 
     let (monitor_expr, prefix_consumed) = extract_monitor_enter(prefix_stmts)?;
+    let monitor_exit_expr = single_monitor_exit_expr(finally_body)?;
+    if !exprs_equivalent(&monitor_expr, &monitor_exit_expr) {
+        return None;
+    }
     let stripped_try_body = strip_monitor_exit_suffix(*try_body.clone(), finally_body)?;
 
     let mut seq_items = Vec::new();
@@ -1105,34 +1267,78 @@ fn extract_monitor_enter(stmts: &[Stmt]) -> Option<(StructuredExpr, usize)> {
 }
 
 fn strip_monitor_exit_suffix(body: StructuredStmt, finally_body: &StructuredStmt) -> Option<StructuredStmt> {
-    let finally_items = top_level_items(finally_body.clone());
-    if finally_items.len() != 1 {
-        return None;
-    }
-    let StructuredStmt::Basic(finally_stmts) = &finally_items[0] else {
-        return None;
-    };
-    if finally_stmts.len() != 1 {
-        return None;
-    }
-    if !matches!(finally_stmts[0], Stmt::MonitorExit(_)) {
-        return None;
-    }
+    let monitor_exit_expr = single_monitor_exit_expr(finally_body)?;
 
     let mut items = top_level_items(body);
     let last = items.pop()?;
     match last {
         StructuredStmt::Basic(mut stmts) => {
-            if !matches!(stmts.last(), Some(Stmt::MonitorExit(_))) {
-                return None;
+            if let Some(Stmt::MonitorExit(expr)) = stmts.last()
+                && exprs_equivalent(expr, &monitor_exit_expr)
+            {
+                stmts.pop();
             }
-            stmts.pop();
             if !stmts.is_empty() {
                 items.push(StructuredStmt::Basic(stmts));
             }
             Some(wrap_sequence(items))
         }
-        _ => None,
+        other => {
+            items.push(other);
+            Some(wrap_sequence(items))
+        }
+    }
+}
+
+fn single_monitor_exit_expr(stmt: &StructuredStmt) -> Option<StructuredExpr> {
+    let items = top_level_items(stmt.clone());
+    if items.len() != 1 {
+        return None;
+    }
+    let StructuredStmt::Basic(stmts) = &items[0] else {
+        return None;
+    };
+    if stmts.len() != 1 {
+        return None;
+    }
+    let Stmt::MonitorExit(expr) = &stmts[0] else {
+        return None;
+    };
+    Some(expr.clone())
+}
+
+fn exprs_equivalent(left: &StructuredExpr, right: &StructuredExpr) -> bool {
+    match (left, right) {
+        (StructuredExpr::This, StructuredExpr::This) => true,
+        (StructuredExpr::Var(left), StructuredExpr::Var(right)) => left == right,
+        (StructuredExpr::Temp(left), StructuredExpr::Temp(right)) => left == right,
+        (
+            StructuredExpr::Field {
+                target: left_target,
+                owner: left_owner,
+                name: left_name,
+                descriptor: left_descriptor,
+                is_static: left_static,
+            },
+            StructuredExpr::Field {
+                target: right_target,
+                owner: right_owner,
+                name: right_name,
+                descriptor: right_descriptor,
+                is_static: right_static,
+            },
+        ) => {
+            left_owner == right_owner
+                && left_name == right_name
+                && left_descriptor == right_descriptor
+                && left_static == right_static
+                && match (left_target, right_target) {
+                    (Some(left), Some(right)) => exprs_equivalent(left, right),
+                    (None, None) => true,
+                    _ => false,
+                }
+        }
+        _ => left == right,
     }
 }
 
@@ -1911,17 +2117,8 @@ fn try_rewrite_synchronized(
         _ => return None,
     };
 
-    let finally_items = top_level_items(finally_body.clone());
-    if finally_items.len() != 1 {
-        return None;
-    }
-    let StructuredStmt::Basic(finally_stmts) = &finally_items[0] else {
-        return None;
-    };
-    if finally_stmts.len() != 1 {
-        return None;
-    }
-    if !matches!(&finally_stmts[0], Stmt::MonitorExit(_)) {
+    let monitor_exit_expr = single_monitor_exit_expr(finally_body)?;
+    if !exprs_equivalent(&monitor_expr, &monitor_exit_expr) {
         return None;
     }
 

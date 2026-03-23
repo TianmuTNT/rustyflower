@@ -76,6 +76,21 @@ fn compile_vineflower_source(relative_source: &str) -> PathBuf {
     base.join(package_dir).join(format!("{class_name}.class"))
 }
 
+fn assert_no_unresolved_artifacts(output: &str) {
+    assert!(
+        !output.contains("rustyflower: method body decompilation is being implemented incrementally."),
+        "unexpected incremental fallback:\n{output}"
+    );
+    assert!(
+        !output.contains("rustyflower: unsupported goto"),
+        "unexpected unresolved goto:\n{output}"
+    );
+    assert!(
+        !output.contains("<caught-exception>"),
+        "unexpected caught-exception placeholder:\n{output}"
+    );
+}
+
 #[test]
 fn decompiles_straight_line_method() {
     let bytes = class_with_single_method("pkg/TestStraightLine", "sum", "(II)I", true, |method| {
@@ -449,7 +464,7 @@ fn decompiles_simple_try_finally() {
 }
 
 #[test]
-fn keeps_simple_try_catch_finally_stable() {
+fn decompiles_simple_try_catch_finally() {
     let bytes = class_with_single_method("pkg/TestTryCatchFinallySynth", "run", "()I", true, |method| {
         let try_start = Label::new();
         let try_end = Label::new();
@@ -529,11 +544,11 @@ fn keeps_simple_try_catch_finally_stable() {
     });
 
     let output = rustyflower::decompile_bytes(&bytes).expect("decompilation should succeed");
-    assert!(
-        output.contains("try {")
-            || output
-                .contains("rustyflower: method body decompilation is being implemented incrementally.")
-    );
+    assert!(output.contains("try {"));
+    assert!(output.contains("catch (java.lang.RuntimeException"));
+    assert!(output.contains("finally {"));
+    assert!(output.contains("return var1;") || output.contains("return -1;") || output.contains("return 1;"));
+    assert_no_unresolved_artifacts(&output);
 }
 
 #[test]
@@ -604,58 +619,53 @@ fn keeps_vineflower_string_switch_fixture_stable() {
 }
 
 #[test]
-fn keeps_vineflower_try_catch_finally_fixture_stable() {
+fn decompiles_vineflower_try_catch_finally_fixture() {
     // Reference: vineflower/test/org/jetbrains/java/decompiler/SingleClassesTest.java -> TestTryCatchFinally
     let class_path = compile_vineflower_source("testData/src/java8/pkg/TestTryCatchFinally.java");
     let output = rustyflower::decompile_path(&class_path).expect("fixture should decompile");
     assert!(output.contains("public class TestTryCatchFinally"));
-    assert!(
-        output.contains("try {")
-            || output.contains(
-                "rustyflower: method body decompilation is being implemented incrementally."
-            )
-    );
+    assert!(output.contains("try {"));
+    assert!(output.contains("catch (java.lang.Exception"));
+    assert!(output.contains("finally {"));
+    assert!(output.contains("java.lang.System.out.println(\"sout1\");"));
+    assert!(output.contains("java.lang.System.out.println(\"finally\");"));
+    assert_no_unresolved_artifacts(&output);
 }
 
 #[test]
-fn keeps_vineflower_try_finally_fixture_stable() {
+fn decompiles_vineflower_try_finally_fixture() {
     // Reference: vineflower/test/org/jetbrains/java/decompiler/SingleClassesTest.java -> TestTryFinally
     let class_path = compile_vineflower_source("testData/src/java8/pkg/TestTryFinally.java");
     let output = rustyflower::decompile_path(&class_path).expect("fixture should decompile");
     assert!(output.contains("public class TestTryFinally"));
-    assert!(
-        output
-            .contains("rustyflower: method body decompilation is being implemented incrementally.")
-            || output.contains("try {")
-    );
+    assert!(output.contains("finally {"));
+    assert!(output.contains("java.lang.System.out.println(\"Finally\");"));
+    assert!(output.contains("if ((arg0 > 0))") || output.contains("if (arg0 > 0)"));
+    assert_no_unresolved_artifacts(&output);
 }
 
 #[test]
-fn keeps_vineflower_synchronized_mapping_fixture_stable() {
+fn decompiles_vineflower_synchronized_mapping_fixture() {
     // Reference: vineflower/test/org/jetbrains/java/decompiler/SingleClassesTest.java -> TestSynchronizedMapping
     let class_path = compile_vineflower_source("testData/src/java8/pkg/TestSynchronizedMapping.java");
     let output = rustyflower::decompile_path(&class_path).expect("fixture should decompile");
     assert!(output.contains("public class TestSynchronizedMapping"));
-    assert!(
-        output.contains("synchronized (")
-            || output
-                .contains("rustyflower: method body decompilation is being implemented incrementally.")
-    );
+    assert!(output.contains("synchronized (this)"));
+    assert!(output.contains("arg0 = (arg0 + 1);"));
+    assert_no_unresolved_artifacts(&output);
 }
 
 #[test]
-fn keeps_vineflower_switch_in_try_fixture_stable() {
+fn decompiles_vineflower_switch_in_try_fixture() {
     // Reference: vineflower/test/org/jetbrains/java/decompiler/SingleClassesTest.java -> TestSwitchInTry
     let class_path = compile_vineflower_source("testData/src/java8/pkg/TestSwitchInTry.java");
     let output = rustyflower::decompile_path(&class_path).expect("fixture should decompile");
     assert!(output.contains("public class TestSwitchInTry"));
-    assert!(
-        output.contains("switch (")
-            || output.contains("try {")
-            || output.contains(
-                "rustyflower: method body decompilation is being implemented incrementally."
-            )
-    );
+    assert!(output.contains("while ("));
+    assert!(output.contains("try {"));
+    assert!(output.contains("switch ("));
+    assert!(output.contains("catch (java.lang.Exception"));
+    assert_no_unresolved_artifacts(&output);
 }
 
 #[test]
@@ -672,13 +682,20 @@ fn keeps_vineflower_enum_switch_fixture_stable() {
 }
 
 #[test]
-fn falls_back_cleanly_for_complex_fixture() {
+fn decompiles_java1_synchronized_fixture_with_clean_legacy_fallback() {
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let path =
         manifest_dir.join("../vineflower/testData/classes/custom/TestJava1Synchronized.class");
     let output = rustyflower::decompile_path(&path).expect("fixture should decompile");
+    assert!(output.contains("public class TestJava1Synchronized"));
+    assert!(output.contains("synchronized (this)"));
+    assert!(output.contains("while ((var4 < arg0))") || output.contains("while (var4 < arg0)"));
     assert!(
-        output
-            .contains("rustyflower: method body decompilation is being implemented incrementally.")
+        output.matches("rustyflower: method body decompilation is being implemented incrementally.")
+            .count()
+            == 2,
+        "expected exactly the legacy jsr/ret methods to fall back cleanly:\n{output}"
     );
+    assert!(!output.contains("rustyflower: unsupported goto"));
+    assert!(!output.contains("<caught-exception>"));
 }

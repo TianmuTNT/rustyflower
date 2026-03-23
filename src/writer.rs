@@ -4,6 +4,8 @@ use crate::lowering::{ClassPathResolver, lower_switches};
 use crate::structure::{StructuredStmt, SwitchLabel, decompile_method};
 use crate::types::{default_value, format_internal_name, format_type, parse_method_descriptor};
 use rust_asm::constants;
+use rust_asm::insn::Insn;
+use rust_asm::opcodes;
 use rust_asm::types::Type;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
@@ -209,14 +211,121 @@ fn write_method(
     match decompile_method(class, method) {
         Ok(body) => {
             let body = lower_switches(class, method, body, resolver);
+            if contains_legacy_subroutine(method) && contains_unresolved_artifacts(&body) {
+                write_unsupported_body(out, &method.parsed_descriptor.return_type, None);
+                let _ = writeln!(out, "    }}");
+                return;
+            }
             let mut ctx = MethodWriteContext::new(method);
             write_structured_stmt(out, &body, 2, &mut ctx);
         }
-        Err(error) => {
-            write_unsupported_body(out, &method.parsed_descriptor.return_type, Some(&error.to_string()));
+        Err(_error) => {
+            write_unsupported_body(out, &method.parsed_descriptor.return_type, None);
         }
     }
     let _ = writeln!(out, "    }}");
+}
+
+fn contains_legacy_subroutine(method: &LoadedMethod) -> bool {
+    method.instructions.iter().any(|insn| {
+        matches!(
+            insn,
+            Insn::Jump(node) if matches!(node.insn.opcode, opcodes::JSR | opcodes::JSR_W)
+        ) || matches!(insn, Insn::Var(node) if node.insn.opcode == opcodes::RET)
+    })
+}
+
+fn contains_unresolved_artifacts(stmt: &StructuredStmt) -> bool {
+    match stmt {
+        StructuredStmt::Sequence(items) => items.iter().any(contains_unresolved_artifacts),
+        StructuredStmt::Basic(stmts) => stmts.iter().any(stmt_has_unresolved_artifacts),
+        StructuredStmt::Try {
+            try_body,
+            catches,
+            finally_body,
+        } => {
+            contains_unresolved_artifacts(try_body)
+                || catches
+                    .iter()
+                    .any(|catch| contains_unresolved_artifacts(&catch.body))
+                || finally_body
+                    .as_ref()
+                    .is_some_and(|body| contains_unresolved_artifacts(body))
+        }
+        StructuredStmt::Synchronized { expr, body } => {
+            expr_has_unresolved_artifacts(expr) || contains_unresolved_artifacts(body)
+        }
+        StructuredStmt::Switch { expr, arms } => {
+            expr_has_unresolved_artifacts(expr)
+                || arms
+                    .iter()
+                    .any(|arm| contains_unresolved_artifacts(&arm.body))
+        }
+        StructuredStmt::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            expr_has_unresolved_artifacts(condition)
+                || contains_unresolved_artifacts(then_branch)
+                || else_branch
+                    .as_ref()
+                    .is_some_and(|branch| contains_unresolved_artifacts(branch))
+        }
+        StructuredStmt::While { condition, body } => {
+            expr_has_unresolved_artifacts(condition) || contains_unresolved_artifacts(body)
+        }
+        StructuredStmt::Comment(_) => true,
+        StructuredStmt::Empty => false,
+    }
+}
+
+fn stmt_has_unresolved_artifacts(stmt: &Stmt) -> bool {
+    match stmt {
+        Stmt::Assign { target, value } => {
+            expr_has_unresolved_artifacts(target) || expr_has_unresolved_artifacts(value)
+        }
+        Stmt::TempAssign { value, .. } => expr_has_unresolved_artifacts(value),
+        Stmt::Expr(expr) | Stmt::Throw(expr) | Stmt::MonitorEnter(expr) | Stmt::MonitorExit(expr) => {
+            matches!(stmt, Stmt::MonitorEnter(_) | Stmt::MonitorExit(_))
+                || expr_has_unresolved_artifacts(expr)
+        }
+        Stmt::Return(Some(expr)) => expr_has_unresolved_artifacts(expr),
+        Stmt::Return(None) | Stmt::Break => false,
+        Stmt::ConstructorCall { args, .. } => args.iter().any(expr_has_unresolved_artifacts),
+        Stmt::Comment(_) => true,
+    }
+}
+
+fn expr_has_unresolved_artifacts(expr: &StructuredExpr) -> bool {
+    match expr {
+        StructuredExpr::CaughtException(_) => true,
+        StructuredExpr::Field { target, .. } => target
+            .as_ref()
+            .is_some_and(|target| expr_has_unresolved_artifacts(target)),
+        StructuredExpr::ArrayAccess { array, index } => {
+            expr_has_unresolved_artifacts(array) || expr_has_unresolved_artifacts(index)
+        }
+        StructuredExpr::ArrayLength(expr)
+        | StructuredExpr::Unary { expr, .. }
+        | StructuredExpr::Cast { expr, .. }
+        | StructuredExpr::InstanceOf { expr, .. } => expr_has_unresolved_artifacts(expr),
+        StructuredExpr::Binary { left, right, .. } => {
+            expr_has_unresolved_artifacts(left) || expr_has_unresolved_artifacts(right)
+        }
+        StructuredExpr::Call { receiver, args, .. } => {
+            receiver
+                .as_ref()
+                .is_some_and(|receiver| expr_has_unresolved_artifacts(receiver))
+                || args.iter().any(expr_has_unresolved_artifacts)
+        }
+        StructuredExpr::New { args, .. } => args.iter().any(expr_has_unresolved_artifacts),
+        StructuredExpr::NewArray { size, .. } => expr_has_unresolved_artifacts(size),
+        StructuredExpr::This
+        | StructuredExpr::Var(_)
+        | StructuredExpr::Temp(_)
+        | StructuredExpr::Literal(_) => false,
+    }
 }
 
 fn write_unsupported_body(out: &mut String, return_type: &Type, reason: Option<&str>) {
