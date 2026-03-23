@@ -65,6 +65,8 @@ pub enum SwitchLabel {
 }
 
 pub fn decompile_method(class: &LoadedClass, method: &LoadedMethod) -> Result<StructuredStmt> {
+    let normalized = crate::normalize::normalize_method(method)?;
+    let method = &normalized;
     let cfg = build_cfg(method)?;
     if cfg.blocks.is_empty() {
         return Ok(StructuredStmt::Sequence(Vec::new()));
@@ -149,17 +151,17 @@ impl<'a> Builder<'a> {
                 pos += 1;
                 continue;
             }
-            if let Some((stmt, next_pos, consumed)) =
-                self.try_build_synchronized(pos, end_pos, goto_handling.clone())?
+            if !self.suppressed_try_starts.contains(&block_start)
+                && let Some((stmt, next_pos, consumed)) =
+                    self.try_build_try_catch(pos, end_pos, goto_handling.clone())?
             {
                 self.visited.extend(consumed);
                 statements.push(stmt);
                 pos = next_pos;
                 continue;
             }
-            if !self.suppressed_try_starts.contains(&block_start)
-                && let Some((stmt, next_pos, consumed)) =
-                    self.try_build_try_catch(pos, end_pos, goto_handling.clone())?
+            if let Some((stmt, next_pos, consumed)) =
+                self.try_build_synchronized(pos, end_pos, goto_handling.clone())?
             {
                 self.visited.extend(consumed);
                 statements.push(stmt);
@@ -261,9 +263,10 @@ impl<'a> Builder<'a> {
             return Ok(None);
         }
         let handler_pc = catch_all_entries[0].handler_pc;
-        let try_end_pos = self.position_for_offset(end_pc)?;
+        let raw_try_end_pos = self.position_for_offset(end_pc)?;
         let handler_pos = self.position_for_offset(handler_pc)?;
-        if handler_pos < try_end_pos {
+        let try_end_pos = raw_try_end_pos.min(handler_pos);
+        if try_end_pos <= next_pos {
             return Ok(None);
         }
 
@@ -379,11 +382,11 @@ impl<'a> Builder<'a> {
             return Ok(None);
         }
 
-        let try_end_pos = self.position_for_offset(end_pc)?;
-        if try_end_pos <= pos || try_end_pos > end_pos {
+        let raw_try_end_pos = self.position_for_offset(end_pc)?;
+        if raw_try_end_pos <= pos || raw_try_end_pos > end_pos {
             return Ok(None);
         }
-        if (pos..try_end_pos).any(|region_pos| self.visited.contains(&self.cfg.order[region_pos])) {
+        if (pos..raw_try_end_pos).any(|region_pos| self.visited.contains(&self.cfg.order[region_pos])) {
             return Ok(None);
         }
 
@@ -391,9 +394,6 @@ impl<'a> Builder<'a> {
         let mut catch_all_handler = None;
         for entry in entries {
             let handler_pos = self.position_for_offset(entry.handler_pc)?;
-            if handler_pos < try_end_pos {
-                return Ok(None);
-            }
             if handler_pos >= end_pos {
                 continue;
             }
@@ -410,6 +410,14 @@ impl<'a> Builder<'a> {
         typed_handlers.sort_by_key(|(handler_pos, _)| *handler_pos);
         typed_handlers.dedup_by_key(|(handler_pos, _)| *handler_pos);
         if typed_handlers.is_empty() && catch_all_handler.is_none() {
+            return Ok(None);
+        }
+        let try_end_pos = typed_handlers
+            .iter()
+            .map(|(handler_pos, _)| *handler_pos)
+            .chain(catch_all_handler.iter().map(|(handler_pos, _)| *handler_pos))
+            .fold(raw_try_end_pos, usize::min);
+        if try_end_pos <= pos {
             return Ok(None);
         }
 
@@ -1286,26 +1294,7 @@ fn extract_monitor_enter(stmts: &[Stmt]) -> Option<(StructuredExpr, usize)> {
 
 fn strip_monitor_exit_suffix(body: StructuredStmt, finally_body: &StructuredStmt) -> Option<StructuredStmt> {
     let monitor_exit_expr = single_monitor_exit_expr(finally_body)?;
-
-    let mut items = top_level_items(body);
-    let last = items.pop()?;
-    match last {
-        StructuredStmt::Basic(mut stmts) => {
-            if let Some(Stmt::MonitorExit(expr)) = stmts.last()
-                && exprs_equivalent(expr, &monitor_exit_expr)
-            {
-                stmts.pop();
-            }
-            if !stmts.is_empty() {
-                items.push(StructuredStmt::Basic(stmts));
-            }
-            Some(wrap_sequence(items))
-        }
-        other => {
-            items.push(other);
-            Some(wrap_sequence(items))
-        }
-    }
+    Some(strip_monitor_exit_expr(body, &monitor_exit_expr))
 }
 
 fn single_monitor_exit_expr(stmt: &StructuredStmt) -> Option<StructuredExpr> {
@@ -1360,6 +1349,91 @@ fn exprs_equivalent(left: &StructuredExpr, right: &StructuredExpr) -> bool {
     }
 }
 
+fn strip_monitor_exit_expr(stmt: StructuredStmt, monitor_exit_expr: &StructuredExpr) -> StructuredStmt {
+    match stmt {
+        StructuredStmt::Sequence(items) => wrap_sequence(
+            items
+                .into_iter()
+                .map(|item| strip_monitor_exit_expr(item, monitor_exit_expr))
+                .collect(),
+        ),
+        StructuredStmt::Basic(stmts) => {
+            let filtered = stmts
+                .into_iter()
+                .filter(|stmt| {
+                    !matches!(
+                        stmt,
+                        Stmt::MonitorExit(expr) if exprs_equivalent(expr, monitor_exit_expr)
+                    )
+                })
+                .collect::<Vec<_>>();
+            if filtered.is_empty() {
+                StructuredStmt::Empty
+            } else {
+                StructuredStmt::Basic(filtered)
+            }
+        }
+        StructuredStmt::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => StructuredStmt::If {
+            condition,
+            then_branch: Box::new(strip_monitor_exit_expr(*then_branch, monitor_exit_expr)),
+            else_branch: else_branch
+                .map(|branch| Box::new(strip_monitor_exit_expr(*branch, monitor_exit_expr))),
+        },
+        StructuredStmt::While { condition, body } => StructuredStmt::While {
+            condition,
+            body: Box::new(strip_monitor_exit_expr(*body, monitor_exit_expr)),
+        },
+        StructuredStmt::ForEach {
+            var_type,
+            var_name,
+            iterable,
+            body,
+        } => StructuredStmt::ForEach {
+            var_type,
+            var_name,
+            iterable,
+            body: Box::new(strip_monitor_exit_expr(*body, monitor_exit_expr)),
+        },
+        StructuredStmt::Switch { expr, arms } => StructuredStmt::Switch {
+            expr,
+            arms: arms
+                .into_iter()
+                .map(|arm| SwitchArm {
+                    labels: arm.labels,
+                    has_default: arm.has_default,
+                    body: Box::new(strip_monitor_exit_expr(*arm.body, monitor_exit_expr)),
+                })
+                .collect(),
+        },
+        StructuredStmt::Try {
+            try_body,
+            catches,
+            finally_body,
+        } => StructuredStmt::Try {
+            try_body: Box::new(strip_monitor_exit_expr(*try_body, monitor_exit_expr)),
+            catches: catches
+                .into_iter()
+                .map(|catch| CatchArm {
+                    catch_type: catch.catch_type,
+                    catch_var: catch.catch_var,
+                    body: Box::new(strip_monitor_exit_expr(*catch.body, monitor_exit_expr)),
+                })
+                .collect(),
+            finally_body: finally_body
+                .map(|body| Box::new(strip_monitor_exit_expr(*body, monitor_exit_expr))),
+        },
+        StructuredStmt::Synchronized { expr, body } => StructuredStmt::Synchronized {
+            expr,
+            body: Box::new(strip_monitor_exit_expr(*body, monitor_exit_expr)),
+        },
+        other => other,
+    }
+}
+
 fn top_level_items(stmt: StructuredStmt) -> Vec<StructuredStmt> {
     match stmt {
         StructuredStmt::Sequence(items) => items
@@ -1373,7 +1447,13 @@ fn top_level_items(stmt: StructuredStmt) -> Vec<StructuredStmt> {
 fn extract_finally_from_handler(
     stmt: StructuredStmt,
 ) -> Result<(StructuredStmt, Option<u16>)> {
+    if matches!(stmt, StructuredStmt::Empty) {
+        return Ok((StructuredStmt::Empty, None));
+    }
     let (slot, without_binding) = extract_catch_binding_slot(stmt);
+    if matches!(without_binding, StructuredStmt::Empty) {
+        return Ok((StructuredStmt::Empty, slot));
+    }
     let without_throw = strip_terminal_rethrow(without_binding.clone(), slot).ok_or_else(|| {
         DecompileError::Unsupported(format!(
             "catch-all handler is not a canonical finally: {without_binding:?}"

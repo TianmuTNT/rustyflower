@@ -4,6 +4,7 @@ mod error;
 mod expr;
 mod loader;
 mod lowering;
+mod normalize;
 mod structure;
 mod types;
 mod writer;
