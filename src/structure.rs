@@ -142,6 +142,37 @@ pub fn decompile_expression_fallback(
     Ok(Some(StructuredStmt::Basic(vec![Stmt::Return(Some(expr))])))
 }
 
+pub fn decompile_simple_exception_fallback(
+    class: &LoadedClass,
+    method: &LoadedMethod,
+) -> Result<Option<StructuredStmt>> {
+    if method.exception_table.is_empty() {
+        return Ok(None);
+    }
+    let normalized = crate::normalize::normalize_method(method)?;
+    let method = &normalized;
+    let cfg = build_cfg(method)?;
+    if cfg.blocks.is_empty() {
+        return Ok(None);
+    }
+    let semantics = translate_blocks(class, method, &cfg)?;
+    let mut builder = Builder {
+        class,
+        method,
+        cfg: &cfg,
+        semantics: &semantics,
+        visited: HashSet::new(),
+        suppressed_try_starts: HashSet::new(),
+    };
+    if let Ok(Some(stmt)) = builder.try_build_simple_synchronized_try_catch() {
+        return Ok(Some(stmt));
+    }
+    if let Ok(Some(stmt)) = builder.try_build_simple_typed_try_catch() {
+        return Ok(Some(stmt));
+    }
+    Ok(None)
+}
+
 struct Builder<'a> {
     class: &'a LoadedClass,
     method: &'a LoadedMethod,
@@ -322,6 +353,25 @@ fn normalize_expression(expr: StructuredExpr, return_type: &Type) -> StructuredE
     }
 }
 
+fn semantics_to_structured_stmt(semantics: BlockSemantics) -> Result<StructuredStmt> {
+    let mut stmts = semantics.stmts;
+    match semantics.terminator {
+        Terminator::Return(value) => stmts.push(Stmt::Return(value)),
+        Terminator::Throw(value) => stmts.push(Stmt::Throw(value)),
+        Terminator::Fallthrough(None) => {}
+        other => {
+            return Err(DecompileError::Unsupported(format!(
+                "simple fallback only supports terminal slices, got {other:?}"
+            )));
+        }
+    }
+    Ok(if stmts.is_empty() {
+        StructuredStmt::Empty
+    } else {
+        StructuredStmt::Basic(stmts)
+    })
+}
+
 fn is_boolean_true(expr: &StructuredExpr) -> bool {
     matches!(expr, StructuredExpr::Literal(crate::expr::Literal::Boolean(true)))
 }
@@ -335,6 +385,7 @@ struct GotoHandling {
     suppressed: Vec<u16>,
     break_target: Option<u16>,
     continue_target: Option<u16>,
+    active_loop_starts: Vec<u16>,
 }
 
 impl GotoHandling {
@@ -343,6 +394,7 @@ impl GotoHandling {
             suppressed: Vec::new(),
             break_target: None,
             continue_target: None,
+            active_loop_starts: Vec::new(),
         }
     }
 
@@ -351,6 +403,7 @@ impl GotoHandling {
             suppressed: vec![target],
             break_target: None,
             continue_target: None,
+            active_loop_starts: Vec::new(),
         }
     }
 
@@ -359,6 +412,7 @@ impl GotoHandling {
             suppressed: Vec::new(),
             break_target: Some(target),
             continue_target: None,
+            active_loop_starts: Vec::new(),
         }
     }
 
@@ -367,6 +421,7 @@ impl GotoHandling {
             suppressed: Vec::new(),
             break_target: None,
             continue_target: Some(target),
+            active_loop_starts: Vec::new(),
         }
     }
 
@@ -375,6 +430,7 @@ impl GotoHandling {
             suppressed: Vec::new(),
             break_target: Some(break_target),
             continue_target: Some(continue_target),
+            active_loop_starts: vec![continue_target],
         }
     }
 
@@ -385,9 +441,171 @@ impl GotoHandling {
         }
         next
     }
+
+    fn with_active_loop(&self, start_offset: u16) -> Self {
+        let mut next = self.clone();
+        if !next.active_loop_starts.contains(&start_offset) {
+            next.active_loop_starts.push(start_offset);
+        }
+        next
+    }
+
+    fn nested_infinite_loop(&self, start_offset: u16, explicit_break_target: Option<u16>) -> Self {
+        let mut next = self.clone();
+        next.continue_target = Some(start_offset);
+        next.break_target = explicit_break_target.or(self.continue_target).or(self.break_target);
+        if !next.active_loop_starts.contains(&start_offset) {
+            next.active_loop_starts.push(start_offset);
+        }
+        next
+    }
 }
 
 impl<'a> Builder<'a> {
+    fn try_build_simple_typed_try_catch(&mut self) -> Result<Option<StructuredStmt>> {
+        let typed_entries = self
+            .method
+            .exception_table
+            .iter()
+            .filter(|entry| entry.catch_type != 0)
+            .cloned()
+            .collect::<Vec<_>>();
+        if typed_entries.len() != 1
+            || self.method.exception_table.iter().any(|entry| entry.catch_type == 0)
+        {
+            return Ok(None);
+        }
+        let entry = &typed_entries[0];
+        let try_body = self.translate_slice_stmt(entry.start_pc, Some(entry.handler_pc))?;
+        let catch_body = self.translate_slice_stmt(entry.handler_pc, None)?;
+        let catch_type = cp_catch_type(self.class, entry.catch_type)?;
+        let (catch_var, catch_body) = extract_catch_binding(self.method, catch_body, &catch_type);
+        Ok(Some(StructuredStmt::Try {
+            try_body: Box::new(strip_try_comments(try_body)),
+            catches: vec![CatchArm {
+                catch_type,
+                catch_var,
+                body: Box::new(strip_try_comments(catch_body)),
+            }],
+            finally_body: None,
+        }))
+    }
+
+    fn try_build_simple_synchronized_try_catch(&mut self) -> Result<Option<StructuredStmt>> {
+        if self.cfg.order.len() < 2 {
+            return Ok(None);
+        }
+        let prefix_block_id = self.cfg.order[0];
+        let (monitor_expr, prefix_consumed) = match extract_monitor_enter(&self.semantics[prefix_block_id].stmts) {
+            Some(value) => value,
+            None => return Ok(None),
+        };
+        let region_start_offset = self.cfg.blocks[self.cfg.order[1]].start_offset;
+        let typed_entries = self
+            .method
+            .exception_table
+            .iter()
+            .filter(|entry| {
+                entry.start_pc == region_start_offset && entry.catch_type != 0
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if typed_entries.len() != 1 {
+            return Ok(None);
+        }
+        let catch_all_entry = self
+            .method
+            .exception_table
+            .iter()
+            .find(|entry| {
+                entry.start_pc == region_start_offset && entry.catch_type == 0
+            })
+            .cloned();
+        let Some(catch_all_entry) = catch_all_entry else {
+            return Ok(None);
+        };
+
+        let typed_entry = &typed_entries[0];
+        if typed_entry.handler_pc >= catch_all_entry.handler_pc {
+            return Ok(None);
+        }
+
+        let try_body = self.translate_slice_stmt(typed_entry.start_pc, Some(typed_entry.handler_pc))?;
+        let catch_body =
+            self.translate_slice_stmt(typed_entry.handler_pc, Some(catch_all_entry.handler_pc))?;
+        let catch_type = cp_catch_type(self.class, typed_entry.catch_type)?;
+        let (catch_var, catch_body) = extract_catch_binding(self.method, catch_body, &catch_type);
+
+        let canonical_handler = self.translate_slice_stmt(catch_all_entry.handler_pc, None)?;
+        let (canonical_finally, _slot) =
+            extract_finally_from_handler(strip_try_comments(canonical_handler))?;
+        let Some(sync_body) = strip_monitor_exit_suffix(try_body, &canonical_finally) else {
+            return Ok(None);
+        };
+
+        let mut prefix_remaining = self.semantics[prefix_block_id].stmts.clone();
+        prefix_remaining.truncate(prefix_remaining.len().saturating_sub(prefix_consumed));
+        let inner_try = StructuredStmt::Try {
+            try_body: Box::new(strip_try_comments(sync_body)),
+            catches: vec![CatchArm {
+                catch_type,
+                catch_var,
+                body: Box::new(strip_try_comments(catch_body)),
+            }],
+            finally_body: None,
+        };
+        let mut items = Vec::new();
+        if !prefix_remaining.is_empty() {
+            items.push(StructuredStmt::Basic(prefix_remaining));
+        }
+        items.push(StructuredStmt::Synchronized {
+            expr: monitor_expr,
+            body: Box::new(inner_try),
+        });
+        Ok(Some(wrap_sequence(items)))
+    }
+
+    fn translate_slice_stmt(
+        &self,
+        start_offset: u16,
+        end_exclusive_offset: Option<u16>,
+    ) -> Result<StructuredStmt> {
+        let first_index = self
+            .method
+            .instruction_offsets
+            .iter()
+            .position(|offset| *offset == start_offset)
+            .ok_or_else(|| {
+                DecompileError::Unsupported(format!(
+                    "missing instruction for simple fallback at offset {start_offset}"
+                ))
+            })?;
+        let last_index = end_exclusive_offset
+            .and_then(|offset| {
+                self.method
+                    .instruction_offsets
+                    .iter()
+                    .position(|candidate| *candidate >= offset)
+            })
+            .map(|index| index.saturating_sub(1))
+            .unwrap_or_else(|| self.method.instructions.len().saturating_sub(1));
+        if last_index < first_index {
+            return Ok(StructuredStmt::Empty);
+        }
+        let block = crate::cfg::BasicBlock {
+            id: 0,
+            start_offset,
+            end_offset: self.method.instruction_offsets[last_index],
+            first_index,
+            last_index,
+            successors: Vec::new(),
+            exception_successors: Vec::new(),
+        };
+        let mut temp_counter = 0;
+        let semantics = translate_block(self.class, self.method, &block, None, &mut temp_counter)?;
+        semantics_to_structured_stmt(semantics)
+    }
+
     fn build_range(
         &mut self,
         start_pos: usize,
@@ -540,8 +758,14 @@ impl<'a> Builder<'a> {
         if catch_all_entries.is_empty() {
             return Ok(None);
         }
+        let has_typed_handlers = self.method.exception_table.iter().any(|entry| {
+            entry.start_pc == region_start_offset && entry.end_pc == end_pc && entry.catch_type != 0
+        });
+        if has_typed_handlers {
+            return Ok(None);
+        }
         let handler_pc = catch_all_entries[0].handler_pc;
-        let raw_try_end_pos = self.position_for_offset(end_pc)?;
+        let raw_try_end_pos = self.boundary_position_for_offset(end_pc);
         let handler_pos = self.position_for_offset(handler_pc)?;
         let try_end_pos = raw_try_end_pos.min(handler_pos);
         if try_end_pos <= next_pos {
@@ -660,7 +884,7 @@ impl<'a> Builder<'a> {
             return Ok(None);
         }
 
-        let raw_try_end_pos = self.position_for_offset(end_pc)?;
+        let raw_try_end_pos = self.boundary_position_for_offset(end_pc);
         if raw_try_end_pos <= pos || raw_try_end_pos > end_pos {
             return Ok(None);
         }
@@ -1165,6 +1389,9 @@ impl<'a> Builder<'a> {
             } else {
                 continue;
             };
+            if self.has_internal_backedge(start_offset, pos, condition_pos) {
+                continue;
+            }
             if exit_pos <= condition_pos || exit_pos > end_pos {
                 continue;
             }
@@ -1258,6 +1485,137 @@ impl<'a> Builder<'a> {
             body: Box::new(wrap_sequence(body_items)),
         };
         Ok(Some((stmt, exit_pos, vec![block_id, next_block_id])))
+    }
+
+    fn try_build_infinite_loop(
+        &mut self,
+        pos: usize,
+        end_pos: usize,
+        goto_handling: GotoHandling,
+    ) -> Result<Option<(StructuredStmt, usize, Vec<usize>)>> {
+        let block_id = self.cfg.order[pos];
+        let start_offset = self.cfg.blocks[block_id].start_offset;
+        if goto_handling.active_loop_starts.contains(&start_offset) {
+            return Ok(None);
+        }
+
+        let mut last_backedge_pos = None;
+        for candidate_pos in (pos + 1)..end_pos {
+            let candidate_id = self.cfg.order[candidate_pos];
+            if terminator_targets_offset(&self.semantics[candidate_id].terminator, start_offset) {
+                last_backedge_pos = Some(candidate_pos);
+            }
+        }
+        let Some(last_backedge_pos) = last_backedge_pos else {
+            return Ok(None);
+        };
+
+        let explicit_exit_pos = self.find_forward_exit_after(pos, last_backedge_pos, end_pos);
+        if explicit_exit_pos.is_some() {
+            return Ok(None);
+        }
+        let loop_end_pos = explicit_exit_pos.unwrap_or(end_pos);
+        if loop_end_pos <= pos {
+            return Ok(None);
+        }
+
+        let explicit_break_target = self.start_offset_at(loop_end_pos);
+        let body = wrap_sequence(self.build_range(
+            pos,
+            loop_end_pos,
+            goto_handling.nested_infinite_loop(start_offset, explicit_break_target),
+        )?);
+        let consumed = (pos..loop_end_pos)
+            .map(|region_pos| self.cfg.order[region_pos])
+            .collect::<Vec<_>>();
+        Ok(Some((
+            StructuredStmt::While {
+                condition: StructuredExpr::Literal(crate::expr::Literal::Boolean(true)),
+                body: Box::new(body),
+            },
+            loop_end_pos,
+            consumed,
+        )))
+    }
+
+    fn try_build_merge_if_chain(
+        &mut self,
+        pos: usize,
+        end_pos: usize,
+        goto_handling: GotoHandling,
+    ) -> Result<Option<(StructuredStmt, usize, Vec<usize>)>> {
+        let block_id = self.cfg.order[pos];
+        if !self.semantics[block_id].stmts.is_empty()
+            || !matches!(self.semantics[block_id].terminator, Terminator::If { .. })
+        {
+            return Ok(None);
+        }
+
+        let Some(body_start_pos) = ((pos + 1)..end_pos).find(|candidate_pos| {
+            let candidate_id = self.cfg.order[*candidate_pos];
+            !self.semantics[candidate_id].stmts.is_empty()
+        }) else {
+            return Ok(None);
+        };
+        let body_start_offset = self.cfg.blocks[self.cfg.order[body_start_pos]].start_offset;
+        let (merge_pos, next_arm_pos) = match &self.semantics[self.cfg.order[body_start_pos]].terminator {
+            Terminator::Goto(target) => {
+                let merge_pos = self.position_for_offset(*target)?;
+                (merge_pos, body_start_pos + 1)
+            }
+            Terminator::Fallthrough(Some(target)) => {
+                let merge_pos = self.position_for_offset(*target)?;
+                (merge_pos, body_start_pos + 1)
+            }
+            _ => return Ok(None),
+        };
+        if merge_pos <= body_start_pos || merge_pos > end_pos {
+            return Ok(None);
+        }
+        let false_target = if next_arm_pos < merge_pos {
+            self.start_offset_at(next_arm_pos)
+                .map(BranchResolution::Offset)
+                .unwrap_or(BranchResolution::RangeEnd(merge_pos))
+        } else {
+            BranchResolution::RangeEnd(merge_pos)
+        };
+        let mut visiting = HashSet::new();
+        let Some(condition) = self.build_branch_expression(
+            block_id,
+            BranchResolution::Offset(body_start_offset),
+            false_target,
+            &mut visiting,
+        ) else {
+            return Ok(None);
+        };
+
+        let then_goto_handling = self
+            .start_offset_at(merge_pos)
+            .map(|merge_offset| goto_handling.with_suppressed(merge_offset))
+            .unwrap_or_else(|| goto_handling.clone());
+        let then_body = self.build_range(
+            body_start_pos,
+            next_arm_pos.min(merge_pos),
+            then_goto_handling,
+        )?;
+        let else_branch = if next_arm_pos < merge_pos {
+            Some(Box::new(wrap_sequence(self.build_range(
+                next_arm_pos,
+                merge_pos,
+                goto_handling.clone(),
+            )?)))
+        } else {
+            None
+        };
+        let stmt = StructuredStmt::If {
+            condition,
+            then_branch: Box::new(wrap_sequence(then_body)),
+            else_branch,
+        };
+        let consumed = (pos..merge_pos)
+            .map(|region_pos| self.cfg.order[region_pos])
+            .collect::<Vec<_>>();
+        Ok(Some((stmt, merge_pos, consumed)))
     }
 
     fn try_build_chained_while(
@@ -1473,6 +1831,42 @@ impl<'a> Builder<'a> {
             .order
             .get(pos)
             .map(|block_id| self.cfg.blocks[*block_id].start_offset)
+    }
+
+    fn boundary_position_for_offset(&self, offset: u16) -> usize {
+        self.cfg
+            .order
+            .iter()
+            .position(|block_id| self.cfg.blocks[*block_id].start_offset >= offset)
+            .unwrap_or(self.cfg.order.len())
+    }
+
+    fn has_internal_backedge(&self, start_offset: u16, start_pos: usize, end_pos: usize) -> bool {
+        ((start_pos + 1)..end_pos).any(|candidate_pos| {
+            let candidate_id = self.cfg.order[candidate_pos];
+            successor_positions(self.cfg, &self.semantics[candidate_id])
+                .into_iter()
+                .any(|successor_pos| successor_pos >= start_pos && successor_pos < candidate_pos)
+                && !terminator_targets_offset(&self.semantics[candidate_id].terminator, start_offset)
+        })
+    }
+
+    fn find_forward_exit_after(
+        &self,
+        start_pos: usize,
+        last_backedge_pos: usize,
+        end_pos: usize,
+    ) -> Option<usize> {
+        let mut candidates = Vec::new();
+        for pos in start_pos..=last_backedge_pos {
+            let block_id = self.cfg.order[pos];
+            for successor_pos in successor_positions(self.cfg, &self.semantics[block_id]) {
+                if successor_pos > last_backedge_pos && successor_pos <= end_pos {
+                    candidates.push(successor_pos);
+                }
+            }
+        }
+        candidates.into_iter().min()
     }
 
     fn try_build_if(
@@ -2022,6 +2416,11 @@ fn rewrite_control_flow_sequence(items: Vec<StructuredStmt>) -> StructuredStmt {
     let mut output = Vec::new();
     let mut index = 0;
     while index < rewritten.len() {
+        if let Some((stmt, consumed)) = try_rewrite_empty_then_if_chain(&rewritten[index..]) {
+            output.push(stmt);
+            index += consumed;
+            continue;
+        }
         if let Some((stmt, consumed)) = try_rewrite_for_loop(&rewritten[index..]) {
             output.push(stmt);
             index += consumed;
@@ -2031,6 +2430,51 @@ fn rewrite_control_flow_sequence(items: Vec<StructuredStmt>) -> StructuredStmt {
         index += 1;
     }
     wrap_sequence(output)
+}
+
+fn try_rewrite_empty_then_if_chain(items: &[StructuredStmt]) -> Option<(StructuredStmt, usize)> {
+    if items.len() < 4 {
+        return None;
+    }
+    let StructuredStmt::If {
+        condition,
+        then_branch,
+        else_branch: None,
+    } = &items[0]
+    else {
+        return None;
+    };
+    if !is_structurally_empty(then_branch) {
+        return None;
+    }
+    let body = items[1].clone();
+    if matches!(body, StructuredStmt::Empty) {
+        return None;
+    }
+    let merge_target = extract_unsupported_goto_target(&items[2])?;
+    let StructuredStmt::If { .. } = &items[3] else {
+        return None;
+    };
+    let _ = merge_target;
+    Some((
+        StructuredStmt::If {
+            condition: negate_condition(condition.clone()),
+            then_branch: Box::new(body),
+            else_branch: Some(Box::new(items[3].clone())),
+        },
+        4,
+    ))
+}
+
+fn extract_unsupported_goto_target(stmt: &StructuredStmt) -> Option<u16> {
+    let StructuredStmt::Basic(stmts) = stmt else {
+        return None;
+    };
+    let [Stmt::Comment(message)] = stmts.as_slice() else {
+        return None;
+    };
+    let suffix = message.strip_prefix("rustyflower: unsupported goto to offset ")?;
+    suffix.parse().ok()
 }
 
 fn try_rewrite_for_loop(items: &[StructuredStmt]) -> Option<(StructuredStmt, usize)> {
@@ -2176,16 +2620,21 @@ fn try_fold_synchronized_pair(items: &[StructuredStmt]) -> Option<(StructuredStm
     else {
         return None;
     };
-    if !catches.is_empty() {
-        return None;
-    }
-
     let (monitor_expr, prefix_consumed) = extract_monitor_enter(prefix_stmts)?;
     let monitor_exit_expr = single_monitor_exit_expr(finally_body)?;
     if !exprs_equivalent(&monitor_expr, &monitor_exit_expr) {
         return None;
     }
     let stripped_try_body = strip_monitor_exit_suffix(*try_body.clone(), finally_body)?;
+    let sync_body = if catches.is_empty() {
+        stripped_try_body
+    } else {
+        StructuredStmt::Try {
+            try_body: Box::new(stripped_try_body),
+            catches: catches.clone(),
+            finally_body: None,
+        }
+    };
 
     let mut seq_items = Vec::new();
     let mut prefix_remaining = prefix_stmts.clone();
@@ -2195,7 +2644,7 @@ fn try_fold_synchronized_pair(items: &[StructuredStmt]) -> Option<(StructuredStm
     }
     seq_items.push(StructuredStmt::Synchronized {
         expr: monitor_expr,
-        body: Box::new(stripped_try_body),
+        body: Box::new(sync_body),
     });
     Some((wrap_sequence(seq_items), 2))
 }
@@ -3388,6 +3837,12 @@ fn fallback_catch_var(catch_type: &str) -> String {
     format!("{first}0")
 }
 
+fn cp_catch_type(class: &LoadedClass, catch_type: u16) -> Result<String> {
+    crate::bytecode::cp_class_name(&class.constant_pool, catch_type)
+        .map(str::to_string)
+        .map_err(|_| DecompileError::Unsupported("invalid catch type".to_string()))
+}
+
 fn successor_positions(cfg: &ControlFlowGraph, semantics: &BlockSemantics) -> Vec<usize> {
     let mut positions = Vec::new();
     match &semantics.terminator {
@@ -3427,6 +3882,25 @@ fn successor_positions(cfg: &ControlFlowGraph, semantics: &BlockSemantics) -> Ve
     positions.sort_unstable();
     positions.dedup();
     positions
+}
+
+fn terminator_targets_offset(terminator: &Terminator, offset: u16) -> bool {
+    match terminator {
+        Terminator::Goto(target) => *target == offset,
+        Terminator::If {
+            jump_target,
+            fallthrough_target,
+            ..
+        } => *jump_target == offset || *fallthrough_target == offset,
+        Terminator::Switch {
+            default_target,
+            cases,
+            ..
+        } => {
+            *default_target == offset || cases.iter().any(|(_, target)| *target == offset)
+        }
+        Terminator::Return(_) | Terminator::Throw(_) | Terminator::Fallthrough(_) => false,
+    }
 }
 
 fn position_for_block(cfg: &ControlFlowGraph, block_id: usize) -> usize {

@@ -2,8 +2,8 @@ use crate::expr::{BinaryOp, Literal, Stmt, StringConcatPart, StructuredExpr, Una
 use crate::loader::{LoadedClass, LoadedConstant, LoadedField, LoadedMethod};
 use crate::lowering::{ClassPathResolver, lower_switches};
 use crate::structure::{
-    StructuredStmt, SwitchLabel, TryResource, decompile_expression_fallback, decompile_method,
-    rewrite_control_flow,
+    StructuredStmt, SwitchLabel, TryResource, decompile_expression_fallback,
+    decompile_method, decompile_simple_exception_fallback, rewrite_control_flow,
 };
 use crate::types::{
     default_value, format_internal_name, format_signature_type, format_type,
@@ -342,6 +342,10 @@ fn write_method(
         Err(_error) => {
             if let Ok(Some(body)) = decompile_expression_fallback(class, method) {
                 let body = rewrite_control_flow(body);
+                let mut ctx = MethodWriteContext::new(class, method, resolver);
+                write_structured_stmt(out, &body, indent + 1, &mut ctx);
+            } else if let Ok(Some(body)) = decompile_simple_exception_fallback(class, method) {
+                let body = rewrite_control_flow(lower_switches(class, method, body, resolver));
                 let mut ctx = MethodWriteContext::new(class, method, resolver);
                 write_structured_stmt(out, &body, indent + 1, &mut ctx);
             } else {
